@@ -439,10 +439,55 @@ impl FeedCollector {
                 return data;
             }
         }
-        let resp = HTTP_CLIENT.get(&self.feed_url).send().await;
+        let resp = HTTP_CLIENT
+            .get(&self.feed_url)
+            .header("User-Agent", format!("{}/{}", TOOL_NAME, VERSION))
+            .send()
+            .await;
         let raw = match resp {
             Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
-            _ => String::new(),
+            Ok(r) => {
+                eprintln!(
+                    "[{}] feed '{}' HTTP {} from {}",
+                    "WARN".yellow(),
+                    self.name,
+                    r.status(),
+                    self.feed_url
+                );
+                // Fall back to stale cache if available
+                if let Some(stale) = self.cache.get(self.feed_id, u64::MAX) {
+                    eprintln!(
+                        "[{}] using stale cache for '{}' ({})",
+                        "WARN".yellow(),
+                        self.name,
+                        self.cache.age_str(self.feed_id)
+                    );
+                    let data: FeedData = serde_json::from_value(stale).unwrap_or_default();
+                    *self.data.lock().await = Some(data.clone());
+                    return data;
+                }
+                String::new()
+            }
+            Err(e) => {
+                eprintln!(
+                    "[{}] feed '{}' network error: {}",
+                    "WARN".yellow(),
+                    self.name,
+                    e
+                );
+                if let Some(stale) = self.cache.get(self.feed_id, u64::MAX) {
+                    eprintln!(
+                        "[{}] using stale cache for '{}' ({})",
+                        "WARN".yellow(),
+                        self.name,
+                        self.cache.age_str(self.feed_id)
+                    );
+                    let data: FeedData = serde_json::from_value(stale).unwrap_or_default();
+                    *self.data.lock().await = Some(data.clone());
+                    return data;
+                }
+                String::new()
+            }
         };
         let parsed = (self.parse_fn)(&raw);
         self.cache
@@ -469,20 +514,41 @@ impl ThreatIntelBackend for FeedCollector {
     }
 
     async fn check_ip(&self, ip: &str) -> Vec<ThreatHit> {
+        if self.ip_type.is_empty() {
+            return vec![];
+        }
         let data = self.load().await;
+        // Exact match
         if data.ips.contains(ip) {
-            vec![self.hit(
+            return vec![self.hit(
                 self.ip_type,
                 self.ip_tax,
                 self.ip_conf,
-                json!({ "feed": self.name }),
-            )]
-        } else {
-            vec![]
+                json!({ "feed": self.name, "matched": ip }),
+            )];
         }
+        // CIDR containment match (for feeds that store network ranges)
+        if let Ok(target) = ip.parse::<IpAddr>() {
+            for entry in &data.ips {
+                if let Ok(net) = entry.parse::<ipnet::IpNet>() {
+                    if net.contains(&target) {
+                        return vec![self.hit(
+                            self.ip_type,
+                            self.ip_tax,
+                            self.ip_conf,
+                            json!({ "feed": self.name, "matched_cidr": entry }),
+                        )];
+                    }
+                }
+            }
+        }
+        vec![]
     }
 
     async fn check_domain(&self, domain: &str) -> Vec<ThreatHit> {
+        if self.dom_type.is_empty() {
+            return vec![];
+        }
         let data = self.load().await;
         let parts: Vec<&str> = domain.split('.').collect();
         for i in 0..parts.len() {
@@ -500,9 +566,12 @@ impl ThreatIntelBackend for FeedCollector {
     }
 
     async fn check_url(&self, url: &str) -> Vec<ThreatHit> {
+        if self.url_type.is_empty() {
+            return vec![];
+        }
         let data = self.load().await;
         for feed_url in &data.urls {
-            if url == feed_url || url.starts_with(feed_url) {
+            if url == feed_url || url.starts_with(feed_url.as_str()) {
                 return vec![self.hit(
                     self.url_type,
                     self.url_tax,
@@ -517,16 +586,25 @@ impl ThreatIntelBackend for FeedCollector {
 
 // --- Concrete feed parsers ---------------------------------------------------
 fn urlhaus_parse(raw: &str) -> FeedData {
+    // URLhaus CSV format (abuse.ch):
+    //   # comment lines at top, then header, then:
+    //   id,dateadded,url,url_status,last_online,threat,tags,urlhaus_link,reporter
     let mut data = FeedData::default();
-    for line in raw.lines().skip(1) {
-        if line.starts_with('#') {
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let fields: Vec<&str> = line.split(',').collect();
+        // Simple CSV split honouring one level of double-quotes
+        let fields: Vec<&str> = split_csv_line(line);
+        // url is field index 2 (0-indexed)
         if fields.len() < 3 {
             continue;
         }
-        let url = fields[2].trim_matches('"');
+        let url = fields[2].trim_matches('"').trim();
+        if url.eq_ignore_ascii_case("url") {
+            continue; // header row
+        }
         if url.starts_with("http") {
             data.urls.insert(url.to_string());
             if let Ok(parsed) = Url::parse(url) {
@@ -536,7 +614,7 @@ fn urlhaus_parse(raw: &str) -> FeedData {
                             data.ips.insert(ip.to_string());
                         }
                     } else if is_valid_domain(host) {
-                        data.domains.insert(host.to_string());
+                        data.domains.insert(host.to_lowercase());
                     }
                 }
             }
@@ -545,39 +623,89 @@ fn urlhaus_parse(raw: &str) -> FeedData {
     data
 }
 
+/// Minimal CSV line splitter that respects double-quoted fields.
+fn split_csv_line(line: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let bytes = line.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                fields.push(&line[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    fields.push(&line[start..]);
+    fields
+}
+
 fn feodo_parse(raw: &str) -> FeedData {
+    // FeodoTracker IP blocklist CSV columns:
+    //   first_seen,dst_ip,dst_port,c2_status,last_online,malware
+    // Lines starting with '#' are comments; first non-comment line is the header.
     let mut data = FeedData::default();
+    let mut header_seen = false;
     for line in raw.lines() {
-        if line.starts_with('#') {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let fields: Vec<&str> = line.split(',').collect();
+        if !header_seen {
+            header_seen = true;
+            continue; // skip the header row
+        }
+        let fields: Vec<&str> = line.splitn(6, ',').collect();
         if fields.len() < 2 {
             continue;
         }
-        let ip = fields[1].trim();
-        if let Ok(_) = ip.parse::<IpAddr>() {
-            if !is_private_ip(ip) {
-                data.ips.insert(ip.to_string());
-            }
+        let ip = fields[1].trim().trim_matches('"');
+        if ip.parse::<IpAddr>().is_ok() && !is_private_ip(ip) {            data.ips.insert(ip.to_string());
         }
     }
     data
 }
 
 fn phishtank_parse(raw: &str) -> FeedData {
+    // PhishTank online-valid.csv columns (may vary):
+    //   phish_id,url,phish_detail_url,submission_time,verified,verification_time,online,target
+    // We find the "url" column by header name so layout changes don't break parsing.
     let mut data = FeedData::default();
-    let mut rdr = ReaderBuilder::new().from_reader(raw.as_bytes());
-    for result in rdr.deserialize::<serde_json::Value>() {
-        if let Ok(rec) = result {
-            if let Some(url) = rec.get("url").and_then(|v| v.as_str()) {
-                if url.starts_with("http") {
-                    data.urls.insert(url.to_string());
-                    if let Ok(parsed) = Url::parse(url) {
-                        if let Some(host) = parsed.host_str() {
-                            if is_valid_domain(host) {
-                                data.domains.insert(host.to_string());
-                            }
+    let mut rdr = ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(raw.as_bytes());
+
+    let headers = match rdr.headers() {
+        Ok(h) => h.clone(),
+        Err(_) => return data,
+    };
+    let url_col = headers.iter().position(|h| h.eq_ignore_ascii_case("url"));
+    let url_col = match url_col {
+        Some(c) => c,
+        None => return data, // unrecognised format
+    };
+
+    for result in rdr.records() {
+        let rec = match result {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let url = match rec.get(url_col) {
+            Some(u) => u.trim(),
+            None => continue,
+        };
+        if url.starts_with("http") {
+            data.urls.insert(url.to_string());
+            if let Ok(parsed) = Url::parse(url) {
+                if let Some(host) = parsed.host_str() {
+                    if is_valid_domain(host) {
+                        data.domains.insert(host.to_lowercase());
+                    } else if let Ok(ip) = host.parse::<IpAddr>() {
+                        if !is_private_ip(&ip.to_string()) {
+                            data.ips.insert(ip.to_string());
                         }
                     }
                 }
@@ -609,35 +737,35 @@ fn blocklist_de_parse(raw: &str) -> FeedData {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Ok(_) = line.parse::<IpAddr>() {
-            if !is_private_ip(line) {
-                data.ips.insert(line.to_string());
-            }
+        if line.parse::<IpAddr>().is_ok() && !is_private_ip(line) {
+            data.ips.insert(line.to_string());
         }
     }
     data
 }
 
 fn emerging_threats_parse(raw: &str) -> FeedData {
+    // EmergingThreats fwrules list: one IP or CIDR per line, comments start with '#'
+    // We store CIDRs directly in the `ips` set (using network address notation) to
+    // avoid exploding /16 and /8 blocks into millions of entries.  Matching is done
+    // by the caller via CIDR containment rather than exact set membership.
     let mut data = FeedData::default();
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        // Accept both bare IPs and CIDR notation
         if let Ok(net) = line.parse::<ipnet::IpNet>() {
-            if net.prefix_len() >= 24 {
-                for host in net.hosts().take(256) {
-                    let ip = host.to_string();
-                    if !is_private_ip(&ip) {
-                        data.ips.insert(ip);
-                    }
-                }
-            } else {
-                let ip = net.addr().to_string();
-                if !is_private_ip(&ip) {
-                    data.ips.insert(ip);
-                }
+            let addr = net.addr().to_string();
+            if !is_private_ip(&addr) {
+                // Store as "addr/prefix" so the check_ip logic can match by CIDR
+                data.ips.insert(net.to_string());
+            }
+        } else if let Ok(ip) = line.parse::<IpAddr>() {
+            let s = ip.to_string();
+            if !is_private_ip(&s) {
+                data.ips.insert(s);
             }
         }
     }
@@ -717,7 +845,98 @@ fn otx_parse(raw: &str) -> FeedData {
 }
 
 // =============================================================================
-// 5b. Remote API Backends
+// 5b. OTX Collector (AlienVault OTX, API-key based)
+// =============================================================================
+struct OtxCollector {
+    api_key: String,
+    cache: Arc<FeedCache>,
+    force_refresh: bool,
+    data: Arc<Mutex<Option<FeedData>>>,
+}
+
+impl OtxCollector {
+    const FEED_ID: &'static str = "otx_alienvault";
+    const TTL: u64 = 7200; // 2 h
+
+    async fn load(&self) -> FeedData {
+        {
+            let guard = self.data.lock().await;
+            if let Some(ref d) = *guard {
+                return d.clone();
+            }
+        }
+        if !self.force_refresh {
+            if let Some(cached) = self.cache.get(Self::FEED_ID, Self::TTL) {
+                let fd: FeedData = serde_json::from_value(cached).unwrap_or_default();
+                *self.data.lock().await = Some(fd.clone());
+                return fd;
+            }
+        }
+        let raw = otx_download(&self.api_key).await;
+        let parsed = otx_parse(&raw);
+        if let Ok(v) = serde_json::to_value(&parsed) {
+            self.cache.set(Self::FEED_ID, &v);
+        }
+        *self.data.lock().await = Some(parsed.clone());
+        parsed
+    }
+}
+
+#[async_trait::async_trait]
+impl ThreatIntelBackend for OtxCollector {
+    fn name(&self) -> &'static str {
+        "OTX-AlienVault"
+    }
+    async fn check_ip(&self, ip: &str) -> Vec<ThreatHit> {
+        let data = self.load().await;
+        if data.ips.contains(ip) {
+            vec![ThreatHit {
+                source: self.name().to_string(),
+                classification_type: "malicious-code".to_string(),
+                classification_taxonomy: "malicious-code".to_string(),
+                confidence: 0.80,
+                details: json!({ "feed": "OTX-AlienVault" }),
+            }]
+        } else {
+            vec![]
+        }
+    }
+    async fn check_domain(&self, domain: &str) -> Vec<ThreatHit> {
+        let data = self.load().await;
+        let parts: Vec<&str> = domain.split('.').collect();
+        for i in 0..parts.len() {
+            let candidate = parts[i..].join(".");
+            if data.domains.contains(&candidate) {
+                return vec![ThreatHit {
+                    source: self.name().to_string(),
+                    classification_type: "malicious-code".to_string(),
+                    classification_taxonomy: "malicious-code".to_string(),
+                    confidence: 0.80,
+                    details: json!({ "feed": "OTX-AlienVault", "matched": candidate }),
+                }];
+            }
+        }
+        vec![]
+    }
+    async fn check_url(&self, url: &str) -> Vec<ThreatHit> {
+        let data = self.load().await;
+        for feed_url in &data.urls {
+            if url == feed_url || url.starts_with(feed_url.as_str()) {
+                return vec![ThreatHit {
+                    source: self.name().to_string(),
+                    classification_type: "malicious-code".to_string(),
+                    classification_taxonomy: "malicious-code".to_string(),
+                    confidence: 0.80,
+                    details: json!({ "feed": "OTX-AlienVault", "matched": feed_url }),
+                }];
+            }
+        }
+        vec![]
+    }
+}
+
+// =============================================================================
+// 5c. Remote API Backends
 // =============================================================================
 struct AbuseIPDBBackend {
     api_key: String,
@@ -1095,12 +1314,19 @@ impl ThreatIntelBackend for LocalHeuristicBackend {
 struct Analyser {
     backends: Vec<Arc<dyn ThreatIntelBackend>>,
     rate_limit_ms: u64,
+    verbose: bool,
 }
 
 impl Analyser {
     async fn analyse(&self, observables: &[Observable]) -> Vec<ThreatMatch> {
         let mut matches = Vec::new();
         for obs in observables {
+            if self.verbose {
+                eprintln!(
+                    "[verbose] checking {} '{}' (seen {} time(s), ctx: {})",
+                    obs.kind, obs.value, obs.count, obs.context
+                );
+            }
             for backend in &self.backends {
                 let hits = match obs.kind.as_str() {
                     "ip" => backend.check_ip(&obs.value).await,
@@ -1108,6 +1334,13 @@ impl Analyser {
                     "url" => backend.check_url(&obs.value).await,
                     _ => vec![],
                 };
+                if self.verbose && !hits.is_empty() {
+                    eprintln!(
+                        "[verbose]  → {} hit(s) from backend '{}'",
+                        hits.len(),
+                        backend.name()
+                    );
+                }
                 for hit in hits {
                     matches.push(ThreatMatch {
                         observable: obs.clone(),
@@ -1136,29 +1369,65 @@ fn print_report(matches: &[ThreatMatch], _observables: &[Observable]) {
         return;
     }
     println!("\n{}", "═══ Threat Intelligence Matches ═══".cyan().bold());
+    println!(
+        "{:<14} {:<32} {:<10} {:<18} {:>4}  {}",
+        "Source", "Observable", "Kind", "Classification", "Conf", "Detail"
+    );
+    println!("{}", "─".repeat(100).dimmed());
+
     for m in matches.iter().take(50) {
         let percent = (m.confidence * 100.0) as usize;
-        let color = if percent >= 75 {
-            "red"
+        let conf_str = format!("{:>3}%", percent);
+        let conf_colored = if percent >= 75 {
+            conf_str.red().bold()
         } else if percent >= 45 {
-            "yellow"
+            conf_str.yellow()
         } else {
-            "cyan"
+            conf_str.cyan()
         };
+        let detail = m
+            .details
+            .get("reason")
+            .or_else(|| m.details.get("matched"))
+            .or_else(|| m.details.get("matched_cidr"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         println!(
-            "[{:12}] {:30} [{:15}] {}%   {}",
+            "{:<14} {:<32} {:<10} {:<18} {}  {}",
             m.ti_source,
-            &m.observable.value,
-            m.classification_type,
-            percent.to_string().color(color),
-            m.details
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+            truncate(&m.observable.value, 31),
+            m.observable.kind,
+            truncate(&m.classification_type, 17),
+            conf_colored,
+            detail,
         );
     }
     if matches.len() > 50 {
-        println!("... and {} more matches", matches.len() - 50);
+        println!(
+            "{}",
+            format!("  … and {} more matches (use --output-json for full results)", matches.len() - 50).dimmed()
+        );
+    }
+
+    // Summary
+    let high = matches.iter().filter(|m| m.confidence >= 0.75).count();
+    let med  = matches.iter().filter(|m| m.confidence >= 0.45 && m.confidence < 0.75).count();
+    let low  = matches.iter().filter(|m| m.confidence < 0.45).count();
+    println!("\n{}", "─".repeat(100).dimmed());
+    println!(
+        "Total matches: {}   {} high   {} medium   {} low",
+        matches.len().to_string().bold(),
+        high.to_string().red(),
+        med.to_string().yellow(),
+        low.to_string().cyan()
+    );
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max.saturating_sub(1)])
     }
 }
 
@@ -1349,7 +1618,7 @@ async fn run() -> Result<()> {
         .parse()
         .unwrap_or(4);
     let quiet = args.get_flag("quiet");
-    let _verbose = args.get_flag("verbose");
+    let verbose = args.get_flag("verbose");
     let refresh_feeds = args.get_flag("refresh-feeds");
     let cache_dir = PathBuf::from(args.get_one::<String>("cache-dir").unwrap());
     let include_private = args.get_flag("include-private");
@@ -1368,7 +1637,13 @@ async fn run() -> Result<()> {
     let rate_limit_ms = (rate_limit_secs * 1000.0) as u64;
 
     // Build feed cache
-    let cache = Arc::new(FeedCache::new(cache_dir));
+    let cache = Arc::new(FeedCache::new(cache_dir.clone()));
+    if verbose && !quiet {
+        eprintln!(
+            "[verbose] cache dir: {}",
+            cache_dir.display()
+        );
+    }
 
     // Build backends vector
     let mut backends: Vec<Arc<dyn ThreatIntelBackend>> = Vec::new();
@@ -1512,11 +1787,17 @@ async fn run() -> Result<()> {
         );
         backends.push(Arc::new(feed));
     }
-    if let Some(_otx_key) = args.get_one::<String>("otx-key") {
-        // OTX requires custom download with API key in header.
-        // We would need a custom collector. For brevity, skip in this example.
-        // In a full version you'd implement an OTX collector similar to the other feeds.
-        eprintln!("OTX feed not fully implemented in this example; skipping.");
+    if let Some(otx_key) = args.get_one::<String>("otx-key").cloned() {
+        // OTX: download pulses at startup and parse into a FeedCollector-style FeedData.
+        // We use a dedicated OTX collector that fetches via the API and reuses the cache.
+        let otx_cache = cache.clone();
+        let otx_feed = OtxCollector {
+            api_key: otx_key,
+            cache: otx_cache,
+            force_refresh: refresh_feeds,
+            data: Arc::new(Mutex::new(None)),
+        };
+        backends.push(Arc::new(otx_feed));
     }
 
     // Remote API backends
@@ -1581,6 +1862,29 @@ async fn run() -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        if verbose {
+            println!(
+                "[verbose] cache-dir: {}  rate-limit: {}ms  workers: {}  kinds: {:?}",
+                args.get_one::<String>("cache-dir").unwrap(),
+                rate_limit_ms,
+                workers,
+                {
+                    let mut ks: Vec<_> = kinds.iter().collect();
+                    ks.sort();
+                    ks
+                }
+            );
+            println!(
+                "[verbose] include-private: {}  refresh-feeds: {}",
+                include_private, refresh_feeds
+            );
+            // Print cache age for each local feed
+            for feed_id in &["urlhaus", "feodo_tracker", "phishtank", "bambenek_c2",
+                              "blocklist_de", "emerging_threats", "otx_alienvault"] {
+                let age = cache.age_str(feed_id);
+                eprintln!("[verbose] feed cache '{}': {}", feed_id, age);
+            }
+        }
     }
 
     // Extract observables in parallel
@@ -1595,8 +1899,9 @@ async fn run() -> Result<()> {
         let pb = ProgressBar::new(pcap_files.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{bar:40} {pos}/{len} files")
-                .unwrap(),
+                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} files  {msg}")
+                .unwrap()
+                .progress_chars("█▉▊▋▌▍▎▏ "),
         );
         Some(pb)
     } else {
@@ -1607,11 +1912,17 @@ async fn run() -> Result<()> {
     let all_obs: Vec<Observable> = pcap_files
         .par_iter()
         .flat_map(|path| {
+            if verbose && !quiet {
+                eprintln!("[verbose] extracting: {}", path.display());
+            }
             let result = extract_observables_from_pcap(path, include_private, &kinds)
                 .unwrap_or_else(|e| {
-                    eprintln!("Error extracting {}: {}", path.display(), e);
+                    eprintln!("{} extracting {}: {}", "ERROR".red().bold(), path.display(), e);
                     vec![]
                 });
+            if verbose && !quiet {
+                eprintln!("[verbose] {} → {} observables", path.display(), result.len());
+            }
             if let Some(pb) = &pb {
                 pb.inc(1);
             }
@@ -1641,13 +1952,20 @@ async fn run() -> Result<()> {
         return Ok(());
     }
     if !quiet {
-        println!("Unique observables: {}", unique_obs.len());
+        let ip_count = unique_obs.iter().filter(|o| o.kind == "ip").count();
+        let dom_count = unique_obs.iter().filter(|o| o.kind == "domain").count();
+        let url_count = unique_obs.iter().filter(|o| o.kind == "url").count();
+        println!(
+            "Unique observables: {} (IPs: {}, domains: {}, URLs: {})",
+            unique_obs.len(), ip_count, dom_count, url_count
+        );
         println!("Running lookups across {} backend(s)...", backends.len());
     }
 
     let analyser = Analyser {
         backends,
         rate_limit_ms,
+        verbose: verbose && !quiet,
     };
     let matches = analyser.analyse(&unique_obs).await;
 
