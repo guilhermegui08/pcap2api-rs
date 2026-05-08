@@ -1,5 +1,5 @@
 // =============================================================================
-// pcap2api - Full Rust implementation (all features, compiles, Send-safe)
+// pcap2api-rs - Full Rust implementation (all features, compiles, Send-safe)
 // =============================================================================
 
 use anyhow::{Context, Result};
@@ -33,8 +33,8 @@ async fn main() -> Result<()> {
 // Constants
 // -----------------------------------------------------------------------------
 const VERSION: &str = "2.0.0";
-const TOOL_NAME: &str = "pcap2api";
-const DEFAULT_CACHE_DIR: &str = ".cache/pcap2api";
+const TOOL_NAME: &str = "pcap2api-rs";
+const DEFAULT_CACHE_DIR: &str = ".cache/pcap2api-rs";
 
 lazy_static::lazy_static! {
     static ref PRIVATE_NETS: Vec<ipnet::IpNet> = {
