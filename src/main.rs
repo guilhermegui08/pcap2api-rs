@@ -1315,32 +1315,92 @@ struct Analyser {
     backends: Vec<Arc<dyn ThreatIntelBackend>>,
     rate_limit_ms: u64,
     verbose: bool,
+    quiet: bool,
 }
 
 impl Analyser {
     async fn analyse(&self, observables: &[Observable]) -> Vec<ThreatMatch> {
+        let total_steps = (observables.len() * self.backends.len()) as u64;
+        let global_start = std::time::Instant::now();
+        let mut total_hits: usize = 0;
+
+        // Progress bar — shown whenever not quiet
+        let pb = if !self.quiet {
+            let pb = ProgressBar::new(total_steps);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(
+                        "[{elapsed_precise}] {bar:40.green/black} {pos:>4}/{len} checks  hits: {msg}",
+                    )
+                    .unwrap()
+                    .progress_chars("█▉▊▋▌▍▎▏ "),
+            );
+            pb.set_message("0");
+            Some(pb)
+        } else {
+            None
+        };
+
         let mut matches = Vec::new();
+
         for obs in observables {
+            let obs_start = std::time::Instant::now();
+
             if self.verbose {
-                eprintln!(
-                    "[verbose] checking {} '{}' (seen {} time(s), ctx: {})",
-                    obs.kind, obs.value, obs.count, obs.context
-                );
-            }
-            for backend in &self.backends {
-                let hits = match obs.kind.as_str() {
-                    "ip" => backend.check_ip(&obs.value).await,
-                    "domain" => backend.check_domain(&obs.value).await,
-                    "url" => backend.check_url(&obs.value).await,
-                    _ => vec![],
-                };
-                if self.verbose && !hits.is_empty() {
+                if let Some(ref pb) = pb {
+                    pb.set_message(format!(
+                        "{}  checking {} '{}'",
+                        total_hits,
+                        obs.kind,
+                        truncate(&obs.value, 40),
+                    ));
+                } else {
                     eprintln!(
-                        "[verbose]  → {} hit(s) from backend '{}'",
-                        hits.len(),
-                        backend.name()
+                        "[verbose] checking {} '{}' (seen {} time(s), ctx: {})",
+                        obs.kind, obs.value, obs.count, obs.context
                     );
                 }
+            }
+
+            for backend in &self.backends {
+                let backend_start = std::time::Instant::now();
+
+                let hits = match obs.kind.as_str() {
+                    "ip"     => backend.check_ip(&obs.value).await,
+                    "domain" => backend.check_domain(&obs.value).await,
+                    "url"    => backend.check_url(&obs.value).await,
+                    _        => vec![],
+                };
+
+                let backend_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+
+                if self.verbose {
+                    let hit_indicator = if hits.is_empty() {
+                        "·".to_string()
+                    } else {
+                        format!("HIT x{}", hits.len())
+                    };
+                    let msg = format!(
+                        "[verbose]  [{:>8}] {:>18}  {}  ({:.0}ms)",
+                        obs.kind,
+                        truncate(backend.name(), 18),
+                        hit_indicator,
+                        backend_ms,
+                    );
+                    if let Some(ref pb) = pb {
+                        pb.println(&msg);
+                    } else {
+                        eprintln!("{}", msg);
+                    }
+                }
+
+                total_hits += hits.len();
+
+                if let Some(ref pb) = pb {
+                    pb.set_message(total_hits.to_string());
+                    pb.inc(1);
+                }
+
                 for hit in hits {
                     matches.push(ThreatMatch {
                         observable: obs.clone(),
@@ -1351,15 +1411,46 @@ impl Analyser {
                         details: hit.details,
                     });
                 }
+
                 if self.rate_limit_ms > 0 {
                     sleep(Duration::from_millis(self.rate_limit_ms)).await;
                 }
             }
+
+            if self.verbose {
+                let obs_ms = obs_start.elapsed().as_secs_f64() * 1000.0;
+                let summary = format!(
+                    "[verbose] '{}' done in {:.0}ms — {} hit(s) so far",
+                    truncate(&obs.value, 40),
+                    obs_ms,
+                    total_hits,
+                );
+                if let Some(ref pb) = pb {
+                    pb.println(&summary);
+                } else {
+                    eprintln!("{}", summary);
+                }
+            }
         }
+
+        let total_secs = global_start.elapsed().as_secs_f64();
+        if let Some(pb) = pb {
+            pb.finish_with_message(format!(
+                "{}  — done in {:.2}s",
+                total_hits,
+                total_secs,
+            ));
+        } else if !self.quiet {
+            println!(
+                "Lookups complete: {} hit(s) in {:.2}s",
+                total_hits,
+                total_secs,
+            );
+        }
+
         matches
     }
 }
-
 // =============================================================================
 // 7. Reporting & Export
 // =============================================================================
@@ -1959,13 +2050,18 @@ async fn run() -> Result<()> {
             "Unique observables: {} (IPs: {}, domains: {}, URLs: {})",
             unique_obs.len(), ip_count, dom_count, url_count
         );
-        println!("Running lookups across {} backend(s)...", backends.len());
+        println!(
+            "Running {} checks across {} backend(s)…",
+            unique_obs.len() * backends.len(),
+            backends.len()
+        );
     }
 
     let analyser = Analyser {
         backends,
         rate_limit_ms,
         verbose: verbose && !quiet,
+        quiet,
     };
     let matches = analyser.analyse(&unique_obs).await;
 
