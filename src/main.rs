@@ -1,5 +1,26 @@
 // =============================================================================
-// pcap2api-rs - Full Rust implementation (all features, compiles, Send-safe)
+// pcap2api-rs v2.1 — PCAP Threat Intelligence Analyser
+//
+// Changes from v2.0:
+//   • Rate limiting now ONLY applied to remote API backends (AbuseIPDB,
+//     VirusTotal, Shodan, IntelMQ-API). Local feed collectors never sleep.
+//   • Feed download failures are reported with specific error context:
+//     HTTP 403 → "access restricted (registration/key required)"
+//     HTTP 429 → "rate limited by provider"
+//     Network   → "network unreachable / timeout"
+//   • Bambenek 403 is handled gracefully with a named fallback message.
+//   • Richer terminal report:
+//     - Asset type shown with a text badge [IP] [DOMAIN] [URL]
+//     - Severity column (HIGH / MED / LOW) with color
+//     - Source file column in the matches table
+//     - Per-file summary before the consolidated report
+//     - Feed status table at the end
+//   • Richer CSV output:
+//     - severity column
+//     - count (how many times the observable appeared in the capture)
+//     - context (dns-query, http-host, source, destination…)
+//     - source_file
+//     - details expanded into individual columns where stable
 // =============================================================================
 
 use anyhow::{Context, Result};
@@ -32,38 +53,47 @@ async fn main() -> Result<()> {
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
-const VERSION: &str = "2.0.0";
-const TOOL_NAME: &str = "pcap2api-rs";
-const DEFAULT_CACHE_DIR: &str = ".cache/pcap2api-rs";
+const VERSION: &str = "2.1.0";
+const TOOL_NAME: &str = "pcap2api";
+const DEFAULT_CACHE_DIR: &str = ".cache/pcap2api";
 
 lazy_static::lazy_static! {
     static ref PRIVATE_NETS: Vec<ipnet::IpNet> = {
-        let strs = vec![
+        [
             "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
             "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
-        ];
-        strs.iter().map(|s| s.parse().unwrap()).collect()
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect()
     };
+
     static ref SERVICES: HashMap<u16, &'static str> = {
         let mut m = HashMap::new();
-        m.insert(21, "ftp"); m.insert(22, "ssh"); m.insert(23, "telnet");
-        m.insert(25, "smtp"); m.insert(53, "dns"); m.insert(80, "http");
-        m.insert(110, "pop3"); m.insert(143, "imap"); m.insert(443, "https");
-        m.insert(445, "smb"); m.insert(3306, "mysql"); m.insert(3389, "rdp");
-        m.insert(5432, "postgresql"); m.insert(6379, "redis"); m.insert(8080, "http-alt");
-        m.insert(8443, "https-alt"); m.insert(27017, "mongodb"); m.insert(6667, "irc");
-        m.insert(4444, "metasploit"); m.insert(1433, "mssql"); m.insert(5900, "vnc");
+        m.insert(21,    "ftp");         m.insert(22,    "ssh");
+        m.insert(23,    "telnet");      m.insert(25,    "smtp");
+        m.insert(53,    "dns");         m.insert(80,    "http");
+        m.insert(110,   "pop3");        m.insert(143,   "imap");
+        m.insert(443,   "https");       m.insert(445,   "smb");
+        m.insert(3306,  "mysql");       m.insert(3389,  "rdp");
+        m.insert(5432,  "postgresql");  m.insert(6379,  "redis");
+        m.insert(8080,  "http-alt");    m.insert(8443,  "https-alt");
+        m.insert(27017, "mongodb");     m.insert(6667,  "irc");
+        m.insert(4444,  "metasploit");  m.insert(1433,  "mssql");
+        m.insert(5900,  "vnc");
         m
     };
+
     static ref SUSPICIOUS_PORTS: HashSet<u16> = {
-        let mut s = HashSet::new();
-        s.insert(4444); s.insert(1337); s.insert(31337); s.insert(12345);
-        s.insert(54321); s.insert(6666); s.insert(6667); s.insert(6668);
-        s.insert(1080); s.insert(9050); s.insert(9051);
-        s
+        [4444u16, 1337, 31337, 12345, 54321, 6666, 6667, 6668, 1080, 9050, 9051]
+            .iter()
+            .cloned()
+            .collect()
     };
+
     static ref HTTP_CLIENT: reqwest::Client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .user_agent(format!("{}/{}", TOOL_NAME, VERSION))
         .build()
         .unwrap();
 }
@@ -71,11 +101,12 @@ lazy_static::lazy_static! {
 // =============================================================================
 // 1. Data Models
 // =============================================================================
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Observable {
-    pub kind: String,
+    pub kind: String, // "ip" | "domain" | "url" | "port"
     pub value: String,
-    pub context: String,
+    pub context: String, // dns-query, http-host, source, destination, …
     pub source_file: String,
     pub count: usize,
 }
@@ -90,15 +121,56 @@ pub struct ThreatMatch {
     pub details: Value,
 }
 
+impl ThreatMatch {
+    pub fn severity(&self) -> &'static str {
+        if self.confidence >= 0.75 {
+            "HIGH"
+        } else if self.confidence >= 0.45 {
+            "MED"
+        } else {
+            "LOW"
+        }
+    }
+}
+
+/// Describes why a feed failed to load — lets us give targeted advice.
+#[derive(Debug)]
+enum FeedError {
+    Http403,         // access restricted
+    Http429,         // rate limited by provider
+    HttpOther(u16),  // other HTTP error
+    Network(String), // connection / timeout
+}
+
+impl FeedError {
+    fn message(&self, feed_name: &str) -> String {
+        match self {
+            FeedError::Http403 => format!(
+                "[WARN] {}: HTTP 403 — access restricted. \
+                         This feed now requires registration or an API key.",
+                feed_name
+            ),
+            FeedError::Http429 => format!(
+                "[WARN] {}: HTTP 429 — rate limited by provider. \
+                         Try again later or reduce --refresh-feeds frequency.",
+                feed_name
+            ),
+            FeedError::HttpOther(code) => {
+                format!("[WARN] {}: HTTP {} from feed server.", feed_name, code)
+            }
+            FeedError::Network(e) => format!("[WARN] {}: network error — {}.", feed_name, e),
+        }
+    }
+}
+
 // =============================================================================
 // 2. Utilities
 // =============================================================================
+
 fn is_private_ip(addr: &str) -> bool {
-    if let Ok(ip) = addr.parse::<IpAddr>() {
-        PRIVATE_NETS.iter().any(|net| net.contains(&ip))
-    } else {
-        false
-    }
+    addr.parse::<IpAddr>()
+        .map(|ip| PRIVATE_NETS.iter().any(|net| net.contains(&ip)))
+        .unwrap_or(false)
 }
 
 fn is_valid_domain(name: &str) -> bool {
@@ -119,24 +191,53 @@ fn is_valid_domain(name: &str) -> bool {
 fn extract_urls_from_payload(payload: &[u8]) -> Vec<String> {
     let mut urls = Vec::new();
     if let Ok(text) = std::str::from_utf8(payload) {
-        let host_re = Regex::new(r"Host:\s*([^\r\n]+)").unwrap();
-        let req_re = Regex::new(r"(?:GET|POST|PUT|DELETE|HEAD)\s+(\S+)").unwrap();
-        if let (Some(host_cap), Some(req_cap)) = (host_re.captures(text), req_re.captures(text)) {
-            let host = host_cap[1].trim();
-            let path = req_cap[1].trim();
-            urls.push(format!("http://{}{}", host, path));
+        lazy_static::lazy_static! {
+            static ref HOST_RE: Regex = Regex::new(r"Host:\s*([^\r\n]+)").unwrap();
+            static ref REQ_RE:  Regex = Regex::new(r"(?:GET|POST|PUT|DELETE|HEAD)\s+(\S+)").unwrap();
+            static ref URL_RE:  Regex = Regex::new(r#"https?://[^\s"'<>]+"#).unwrap();
         }
-        let url_re = Regex::new(r#"https?://[^\s"'<>]+"#).unwrap();
-        for cap in url_re.captures_iter(text) {
+        if let (Some(hc), Some(rc)) = (HOST_RE.captures(text), REQ_RE.captures(text)) {
+            urls.push(format!("http://{}{}", hc[1].trim(), rc[1].trim()));
+        }
+        for cap in URL_RE.captures_iter(text) {
             urls.push(cap[0].to_string());
         }
     }
     urls
 }
 
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max.saturating_sub(1)])
+    }
+}
+
+fn kind_badge(kind: &str) -> ColoredString {
+    match kind {
+        "ip" => " IP  ".on_blue().white().bold(),
+        "domain" => " DOM ".on_magenta().white().bold(),
+        "url" => " URL ".on_cyan().black().bold(),
+        "port" => " PORT".on_yellow().black().bold(),
+        _ => kind.normal(),
+    }
+}
+
+fn severity_badge(conf: f64) -> ColoredString {
+    if conf >= 0.75 {
+        " HIGH ".on_red().white().bold()
+    } else if conf >= 0.45 {
+        "  MED ".on_yellow().black().bold()
+    } else {
+        "  LOW ".on_bright_black().white()
+    }
+}
+
 // =============================================================================
-// 3. Feed Cache (disk with TTL)
+// 3. Feed Cache
 // =============================================================================
+
 #[derive(Serialize, Deserialize)]
 struct CacheEntry {
     ts: u64,
@@ -158,17 +259,17 @@ impl FeedCache {
         self.dir.join(format!("{}.json", safe))
     }
 
-    fn get(&self, feed_id: &str, ttl_secs: u64) -> Option<Value> {
-        let path = self.path(feed_id);
-        if !path.exists() {
+    fn get(&self, feed_id: &str, ttl: u64) -> Option<Value> {
+        let p = self.path(feed_id);
+        if !p.exists() {
             return None;
         }
-        let data: CacheEntry = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+        let data: CacheEntry = serde_json::from_str(&fs::read_to_string(p).ok()?).ok()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        if now - data.ts < ttl_secs {
+        if now - data.ts < ttl {
             Some(data.payload)
         } else {
             None
@@ -176,37 +277,39 @@ impl FeedCache {
     }
 
     fn set(&self, feed_id: &str, payload: &Value) {
-        let path = self.path(feed_id);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let entry = CacheEntry {
-            ts: now,
-            payload: payload.clone(),
-        };
-        let _ = fs::write(path, serde_json::to_string_pretty(&entry).unwrap());
+        let _ = fs::write(
+            self.path(feed_id),
+            serde_json::to_string_pretty(&CacheEntry {
+                ts: now,
+                payload: payload.clone(),
+            })
+            .unwrap(),
+        );
     }
 
     fn age_str(&self, feed_id: &str) -> String {
-        let path = self.path(feed_id);
-        if !path.exists() {
+        let p = self.path(feed_id);
+        if !p.exists() {
             return "no cache".to_string();
         }
-        if let Ok(data) = fs::read_to_string(&path) {
-            if let Ok(entry) = serde_json::from_str::<CacheEntry>(&data) {
-                let now = SystemTime::now()
+        if let Ok(s) = fs::read_to_string(&p) {
+            if let Ok(e) = serde_json::from_str::<CacheEntry>(&s) {
+                let age = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
-                    .as_secs();
-                let age = now - entry.ts;
-                if age < 120 {
-                    return format!("{}s ago", age);
-                }
-                if age < 7200 {
-                    return format!("{}m ago", age / 60);
-                }
-                return format!("{}h ago", age / 3600);
+                    .as_secs()
+                    - e.ts;
+                return if age < 120 {
+                    format!("{}s ago", age)
+                } else if age < 7200 {
+                    format!("{}m ago", age / 60)
+                } else {
+                    format!("{}h ago", age / 3600)
+                };
             }
         }
         "unknown".to_string()
@@ -214,8 +317,9 @@ impl FeedCache {
 }
 
 // =============================================================================
-// 4. PCAP Extraction (streaming, parallel)
+// 4. PCAP Extraction (streaming via libpcap)
 // =============================================================================
+
 use pcap::Capture;
 
 fn extract_observables_from_pcap(
@@ -225,13 +329,13 @@ fn extract_observables_from_pcap(
 ) -> Result<Vec<Observable>> {
     let mut cap =
         Capture::from_file(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut obs_map: HashMap<String, Observable> = HashMap::new();
+    let mut map: HashMap<String, Observable> = HashMap::new();
 
-    while let Ok(packet) = cap.next_packet() {
-        process_packet(&packet, path, &mut obs_map);
+    while let Ok(pkt) = cap.next_packet() {
+        process_packet(&pkt, path, &mut map);
     }
 
-    let mut list: Vec<Observable> = obs_map.into_values().collect();
+    let mut list: Vec<Observable> = map.into_values().collect();
     list.retain(|o| kinds.contains(&o.kind));
     if !include_private {
         list.retain(|o| o.kind != "ip" || !is_private_ip(&o.value));
@@ -239,55 +343,94 @@ fn extract_observables_from_pcap(
     Ok(list)
 }
 
-fn process_packet(packet: &pcap::Packet, src_file: &Path, map: &mut HashMap<String, Observable>) {
-    if packet.header.caplen < 14 {
+fn add_obs(
+    map: &mut HashMap<String, Observable>,
+    kind: &str,
+    value: &str,
+    context: &str,
+    src: &Path,
+) {
+    let key = format!("{}:{}", kind, value);
+    map.entry(key)
+        .and_modify(|e| e.count += 1)
+        .or_insert_with(|| Observable {
+            kind: kind.to_string(),
+            value: value.to_string(),
+            context: context.to_string(),
+            source_file: src.display().to_string(),
+            count: 1,
+        });
+}
+
+fn process_packet(pkt: &pcap::Packet, src: &Path, map: &mut HashMap<String, Observable>) {
+    let eth = pkt.data;
+    if eth.len() < 14 {
         return;
     }
-    let eth = &packet.data[..];
     let eth_type = u16::from_be_bytes([eth[12], eth[13]]);
     if eth_type != 0x0800 {
-        return; // only IPv4 for simplicity (IPv6 can be added)
-    }
-    let ip_offset = 14;
-    if eth.len() < ip_offset + 20 {
+        return;
+    } // IPv4 only
+
+    let ip = &eth[14..];
+    if ip.len() < 20 {
         return;
     }
-    let ip = &eth[ip_offset..];
+
     let src_ip = std::net::Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
     let dst_ip = std::net::Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
     let proto = ip[9];
     let ihl = ((ip[0] & 0x0F) as usize) * 4;
-    let transport_offset = ip_offset + ihl;
 
-    // IP addresses
-    add_obs(map, "ip", &src_ip.to_string(), "source", src_file);
-    add_obs(map, "ip", &dst_ip.to_string(), "destination", src_file);
+    add_obs(map, "ip", &src_ip.to_string(), "source", src);
+    add_obs(map, "ip", &dst_ip.to_string(), "destination", src);
 
-    if eth.len() < transport_offset + 4 {
+    let tp_offset = 14 + ihl;
+    if eth.len() < tp_offset + 4 {
         return;
     }
-    let transport = &eth[transport_offset..];
-    if proto == 6 && transport.len() >= 20 {
+    let tp = &eth[tp_offset..];
+
+    if proto == 6 && tp.len() >= 20 {
         // TCP
-        let dport = u16::from_be_bytes([transport[2], transport[3]]);
-        add_obs(map, "port", &dport.to_string(), "tcp", src_file);
-        let tcp_hdr_len = ((transport[12] >> 4) & 0x0F) as usize * 4;
-        let payload_start = transport_offset + tcp_hdr_len;
-        if payload_start < eth.len() {
-            let payload = &eth[payload_start..];
-            process_http_payload(payload, map, src_file);
+        let dport = u16::from_be_bytes([tp[2], tp[3]]);
+        let svc_ctx = if SUSPICIOUS_PORTS.contains(&dport) {
+            "suspicious"
+        } else {
+            SERVICES.get(&dport).copied().unwrap_or("tcp")
+        };
+        add_obs(map, "port", &dport.to_string(), svc_ctx, src);
+
+        let tcp_hlen = ((tp[12] >> 4) as usize) * 4;
+        let payload_off = tp_offset + tcp_hlen;
+        if payload_off < eth.len() {
+            for url in extract_urls_from_payload(&eth[payload_off..]) {
+                add_obs(map, "url", &url, "http", src);
+                if let Ok(parsed) = Url::parse(&url) {
+                    if let Some(host) = parsed.host_str() {
+                        if is_valid_domain(host) {
+                            add_obs(map, "domain", host, "http-host", src);
+                        }
+                    }
+                }
+            }
         }
-    } else if proto == 17 && transport.len() >= 8 {
+    } else if proto == 17 && tp.len() >= 8 {
         // UDP
-        let dport = u16::from_be_bytes([transport[2], transport[3]]);
-        add_obs(map, "port", &dport.to_string(), "udp", src_file);
-        if dport == 53 {
-            let payload = &transport[8..];
-            if let Ok(parsed) = dns_parser::Packet::parse(payload) {
-                for q in parsed.questions {
+        let dport = u16::from_be_bytes([tp[2], tp[3]]);
+        let svc_ctx = if SUSPICIOUS_PORTS.contains(&dport) {
+            "suspicious"
+        } else {
+            SERVICES.get(&dport).copied().unwrap_or("udp")
+        };
+        add_obs(map, "port", &dport.to_string(), svc_ctx, src);
+
+        if dport == 53 && tp.len() > 8 {
+            if let Ok(dns) = dns_parser::Packet::parse(&tp[8..]) {
+                for q in dns.questions {
                     let name = q.qname.to_string();
                     if is_valid_domain(&name) {
-                        add_obs(map, "domain", &name, "dns-query", src_file);
+                        add_obs(map, "domain", &name, "dns-query", src);
                     }
                 }
             }
@@ -295,49 +438,17 @@ fn process_packet(packet: &pcap::Packet, src_file: &Path, map: &mut HashMap<Stri
     }
 }
 
-fn add_obs(
-    map: &mut HashMap<String, Observable>,
-    kind: &str,
-    value: &str,
-    context: &str,
-    src_file: &Path,
-) {
-    let key = format!("{}:{}", kind, value);
-    if let Some(entry) = map.get_mut(&key) {
-        entry.count += 1;
-    } else {
-        map.insert(
-            key,
-            Observable {
-                kind: kind.to_string(),
-                value: value.to_string(),
-                context: context.to_string(),
-                source_file: src_file.display().to_string(),
-                count: 1,
-            },
-        );
-    }
-}
-
-fn process_http_payload(payload: &[u8], map: &mut HashMap<String, Observable>, src_file: &Path) {
-    for url in extract_urls_from_payload(payload) {
-        add_obs(map, "url", &url, "http", src_file);
-        if let Ok(parsed) = Url::parse(&url) {
-            if let Some(host) = parsed.host_str() {
-                if is_valid_domain(host) {
-                    add_obs(map, "domain", host, "http-host", src_file);
-                }
-            }
-        }
-    }
-}
-
 // =============================================================================
-// 5. Threat Intelligence Backends (trait)
+// 5. Threat Intelligence Backend trait
 // =============================================================================
+
 #[async_trait::async_trait]
 trait ThreatIntelBackend: Send + Sync {
     fn name(&self) -> &'static str;
+    /// Returns true for backends that make network API calls (need rate limiting).
+    fn is_remote_api(&self) -> bool {
+        false
+    }
     async fn check_ip(&self, ip: &str) -> Vec<ThreatHit>;
     async fn check_domain(&self, domain: &str) -> Vec<ThreatHit>;
     async fn check_url(&self, url: &str) -> Vec<ThreatHit>;
@@ -353,8 +464,16 @@ struct ThreatHit {
 }
 
 // =============================================================================
-// 5a. Local Feed Collectors (IntelMQ pipeline)
+// 6. Local Feed Collectors
 // =============================================================================
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct FeedData {
+    ips: HashSet<String>,
+    domains: HashSet<String>,
+    urls: HashSet<String>,
+}
+
 struct FeedCollector {
     name: &'static str,
     feed_id: &'static str,
@@ -362,6 +481,8 @@ struct FeedCollector {
     ttl: u64,
     cache: Arc<FeedCache>,
     force_refresh: bool,
+    verbose: bool,
+    // Classification defaults per observable type
     ip_type: &'static str,
     ip_tax: &'static str,
     ip_conf: f64,
@@ -375,14 +496,8 @@ struct FeedCollector {
     data: Arc<Mutex<Option<FeedData>>>,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
-struct FeedData {
-    ips: HashSet<String>,
-    domains: HashSet<String>,
-    urls: HashSet<String>,
-}
-
 impl FeedCollector {
+    #[allow(clippy::too_many_arguments)]
     fn new<F>(
         name: &'static str,
         feed_id: &'static str,
@@ -390,6 +505,7 @@ impl FeedCollector {
         ttl: u64,
         cache: Arc<FeedCache>,
         force_refresh: bool,
+        verbose: bool,
         ip_type: &'static str,
         ip_tax: &'static str,
         ip_conf: f64,
@@ -411,6 +527,7 @@ impl FeedCollector {
             ttl,
             cache,
             force_refresh,
+            verbose,
             ip_type,
             ip_tax,
             ip_conf,
@@ -427,71 +544,92 @@ impl FeedCollector {
 
     async fn load(&self) -> FeedData {
         {
-            let guard = self.data.lock().await;
-            if let Some(ref d) = *guard {
+            let g = self.data.lock().await;
+            if let Some(ref d) = *g {
                 return d.clone();
             }
         }
+
+        // Cache hit?
         if !self.force_refresh {
             if let Some(cached) = self.cache.get(self.feed_id, self.ttl) {
-                let data: FeedData = serde_json::from_value(cached).unwrap_or_default();
-                *self.data.lock().await = Some(data.clone());
-                return data;
+                if self.verbose {
+                    eprintln!(
+                        "  [cache] {} ({})",
+                        self.name,
+                        self.cache.age_str(self.feed_id)
+                    );
+                }
+                let d: FeedData = serde_json::from_value(cached).unwrap_or_default();
+                *self.data.lock().await = Some(d.clone());
+                return d;
             }
         }
-        let resp = HTTP_CLIENT
-            .get(&self.feed_url)
-            .header("User-Agent", format!("{}/{}", TOOL_NAME, VERSION))
-            .send()
-            .await;
+
+        if self.verbose {
+            eprintln!("  [fetch] {} <- {}", self.name, self.feed_url);
+        }
+
+        // Download with explicit error categorisation
+        let resp = HTTP_CLIENT.get(&self.feed_url).send().await;
         let raw = match resp {
             Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
             Ok(r) => {
-                eprintln!(
-                    "[{}] feed '{}' HTTP {} from {}",
-                    "WARN".yellow(),
-                    self.name,
-                    r.status(),
-                    self.feed_url
-                );
+                let err = match r.status().as_u16() {
+                    403 => FeedError::Http403,
+                    429 => FeedError::Http429,
+                    c => FeedError::HttpOther(c),
+                };
+                eprintln!("{}", err.message(self.name).yellow());
                 // Fall back to stale cache if available
-                if let Some(stale) = self.cache.get(self.feed_id, u64::MAX) {
+                let stale = self.cache.get(self.feed_id, u64::MAX);
+                if let Some(v) = stale {
                     eprintln!(
-                        "[{}] using stale cache for '{}' ({})",
-                        "WARN".yellow(),
+                        "  [info]  {} using stale cache ({})",
                         self.name,
                         self.cache.age_str(self.feed_id)
                     );
-                    let data: FeedData = serde_json::from_value(stale).unwrap_or_default();
-                    *self.data.lock().await = Some(data.clone());
-                    return data;
+                    let d: FeedData = serde_json::from_value(v).unwrap_or_default();
+                    *self.data.lock().await = Some(d.clone());
+                    return d;
                 }
-                String::new()
+                *self.data.lock().await = Some(FeedData::default());
+                return FeedData::default();
             }
             Err(e) => {
-                eprintln!(
-                    "[{}] feed '{}' network error: {}",
-                    "WARN".yellow(),
-                    self.name,
-                    e
-                );
-                if let Some(stale) = self.cache.get(self.feed_id, u64::MAX) {
+                let err = FeedError::Network(e.to_string());
+                eprintln!("{}", err.message(self.name).yellow());
+                let stale = self.cache.get(self.feed_id, u64::MAX);
+                if let Some(v) = stale {
                     eprintln!(
-                        "[{}] using stale cache for '{}' ({})",
-                        "WARN".yellow(),
+                        "  [info]  {} using stale cache ({})",
                         self.name,
                         self.cache.age_str(self.feed_id)
                     );
-                    let data: FeedData = serde_json::from_value(stale).unwrap_or_default();
-                    *self.data.lock().await = Some(data.clone());
-                    return data;
+                    let d: FeedData = serde_json::from_value(v).unwrap_or_default();
+                    *self.data.lock().await = Some(d.clone());
+                    return d;
                 }
-                String::new()
+                *self.data.lock().await = Some(FeedData::default());
+                return FeedData::default();
             }
         };
+
         let parsed = (self.parse_fn)(&raw);
-        self.cache
-            .set(self.feed_id, &serde_json::to_value(&parsed).unwrap());
+
+        if self.verbose {
+            eprintln!(
+                "  [ok]    {} — ips:{} domains:{} urls:{}",
+                self.name,
+                parsed.ips.len(),
+                parsed.domains.len(),
+                parsed.urls.len()
+            );
+        }
+
+        if let Ok(v) = serde_json::to_value(&parsed) {
+            self.cache.set(self.feed_id, &v);
+        }
         *self.data.lock().await = Some(parsed.clone());
         parsed
     }
@@ -512,13 +650,16 @@ impl ThreatIntelBackend for FeedCollector {
     fn name(&self) -> &'static str {
         self.name
     }
+    fn is_remote_api(&self) -> bool {
+        false
+    } // local feed — no rate limiting needed
 
     async fn check_ip(&self, ip: &str) -> Vec<ThreatHit> {
         if self.ip_type.is_empty() {
             return vec![];
         }
         let data = self.load().await;
-        // Exact match
+        // Exact set membership (O(1))
         if data.ips.contains(ip) {
             return vec![self.hit(
                 self.ip_type,
@@ -527,7 +668,7 @@ impl ThreatIntelBackend for FeedCollector {
                 json!({ "feed": self.name, "matched": ip }),
             )];
         }
-        // CIDR containment match (for feeds that store network ranges)
+        // CIDR containment for feeds that store network ranges
         if let Ok(target) = ip.parse::<IpAddr>() {
             for entry in &data.ips {
                 if let Ok(net) = entry.parse::<ipnet::IpNet>() {
@@ -570,8 +711,17 @@ impl ThreatIntelBackend for FeedCollector {
             return vec![];
         }
         let data = self.load().await;
+        // Exact match first (O(1)), then prefix scan
+        if data.urls.contains(url) {
+            return vec![self.hit(
+                self.url_type,
+                self.url_tax,
+                self.url_conf,
+                json!({ "feed": self.name, "matched": url }),
+            )];
+        }
         for feed_url in &data.urls {
-            if url == feed_url || url.starts_with(feed_url.as_str()) {
+            if url.starts_with(feed_url.as_str()) {
                 return vec![self.hit(
                     self.url_type,
                     self.url_tax,
@@ -584,55 +734,18 @@ impl ThreatIntelBackend for FeedCollector {
     }
 }
 
-// --- Concrete feed parsers ---------------------------------------------------
-fn urlhaus_parse(raw: &str) -> FeedData {
-    // URLhaus CSV format (abuse.ch):
-    //   # comment lines at top, then header, then:
-    //   id,dateadded,url,url_status,last_online,threat,tags,urlhaus_link,reporter
-    let mut data = FeedData::default();
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // Simple CSV split honouring one level of double-quotes
-        let fields: Vec<&str> = split_csv_line(line);
-        // url is field index 2 (0-indexed)
-        if fields.len() < 3 {
-            continue;
-        }
-        let url = fields[2].trim_matches('"').trim();
-        if url.eq_ignore_ascii_case("url") {
-            continue; // header row
-        }
-        if url.starts_with("http") {
-            data.urls.insert(url.to_string());
-            if let Ok(parsed) = Url::parse(url) {
-                if let Some(host) = parsed.host_str() {
-                    if let Ok(ip) = host.parse::<IpAddr>() {
-                        if !is_private_ip(&ip.to_string()) {
-                            data.ips.insert(ip.to_string());
-                        }
-                    } else if is_valid_domain(host) {
-                        data.domains.insert(host.to_lowercase());
-                    }
-                }
-            }
-        }
-    }
-    data
-}
+// =============================================================================
+// 6a. Feed parsers (unchanged from v2.0, kept compact)
+// =============================================================================
 
-/// Minimal CSV line splitter that respects double-quoted fields.
 fn split_csv_line(line: &str) -> Vec<&str> {
     let mut fields = Vec::new();
     let mut start = 0;
-    let mut in_quotes = false;
-    let bytes = line.as_bytes();
-    for i in 0..bytes.len() {
-        match bytes[i] {
-            b'"' => in_quotes = !in_quotes,
-            b',' if !in_quotes => {
+    let mut in_q = false;
+    for (i, b) in line.bytes().enumerate() {
+        match b {
+            b'"' => in_q = !in_q,
+            b',' if !in_q => {
                 fields.push(&line[start..i]);
                 start = i + 1;
             }
@@ -643,11 +756,41 @@ fn split_csv_line(line: &str) -> Vec<&str> {
     fields
 }
 
+fn urlhaus_parse(raw: &str) -> FeedData {
+    let mut d = FeedData::default();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = split_csv_line(line);
+        if fields.len() < 3 {
+            continue;
+        }
+        let url = fields[2].trim_matches('"').trim();
+        if url.eq_ignore_ascii_case("url") {
+            continue;
+        }
+        if url.starts_with("http") {
+            d.urls.insert(url.to_string());
+            if let Ok(parsed) = Url::parse(url) {
+                if let Some(host) = parsed.host_str() {
+                    if let Ok(ip) = host.parse::<IpAddr>() {
+                        if !is_private_ip(&ip.to_string()) {
+                            d.ips.insert(ip.to_string());
+                        }
+                    } else if is_valid_domain(host) {
+                        d.domains.insert(host.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
+    d
+}
+
 fn feodo_parse(raw: &str) -> FeedData {
-    // FeodoTracker IP blocklist CSV columns:
-    //   first_seen,dst_ip,dst_port,c2_status,last_online,malware
-    // Lines starting with '#' are comments; first non-comment line is the header.
-    let mut data = FeedData::default();
+    let mut d = FeedData::default();
     let mut header_seen = false;
     for line in raw.lines() {
         let line = line.trim();
@@ -656,67 +799,57 @@ fn feodo_parse(raw: &str) -> FeedData {
         }
         if !header_seen {
             header_seen = true;
-            continue; // skip the header row
+            continue;
         }
         let fields: Vec<&str> = line.splitn(6, ',').collect();
         if fields.len() < 2 {
             continue;
         }
         let ip = fields[1].trim().trim_matches('"');
-        if ip.parse::<IpAddr>().is_ok() && !is_private_ip(ip) {            data.ips.insert(ip.to_string());
+        if ip.parse::<IpAddr>().is_ok() && !is_private_ip(ip) {
+            d.ips.insert(ip.to_string());
         }
     }
-    data
+    d
 }
 
 fn phishtank_parse(raw: &str) -> FeedData {
-    // PhishTank online-valid.csv columns (may vary):
-    //   phish_id,url,phish_detail_url,submission_time,verified,verification_time,online,target
-    // We find the "url" column by header name so layout changes don't break parsing.
-    let mut data = FeedData::default();
+    let mut d = FeedData::default();
     let mut rdr = ReaderBuilder::new()
         .flexible(true)
         .from_reader(raw.as_bytes());
-
     let headers = match rdr.headers() {
         Ok(h) => h.clone(),
-        Err(_) => return data,
+        Err(_) => return d,
     };
-    let url_col = headers.iter().position(|h| h.eq_ignore_ascii_case("url"));
-    let url_col = match url_col {
+    let url_col = match headers.iter().position(|h| h.eq_ignore_ascii_case("url")) {
         Some(c) => c,
-        None => return data, // unrecognised format
+        None => return d,
     };
-
-    for result in rdr.records() {
-        let rec = match result {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let url = match rec.get(url_col) {
-            Some(u) => u.trim(),
-            None => continue,
-        };
-        if url.starts_with("http") {
-            data.urls.insert(url.to_string());
-            if let Ok(parsed) = Url::parse(url) {
-                if let Some(host) = parsed.host_str() {
-                    if is_valid_domain(host) {
-                        data.domains.insert(host.to_lowercase());
-                    } else if let Ok(ip) = host.parse::<IpAddr>() {
-                        if !is_private_ip(&ip.to_string()) {
-                            data.ips.insert(ip.to_string());
+    for rec in rdr.records().flatten() {
+        if let Some(url) = rec.get(url_col) {
+            let url = url.trim();
+            if url.starts_with("http") {
+                d.urls.insert(url.to_string());
+                if let Ok(p) = Url::parse(url) {
+                    if let Some(host) = p.host_str() {
+                        if is_valid_domain(host) {
+                            d.domains.insert(host.to_lowercase());
+                        } else if let Ok(ip) = host.parse::<IpAddr>() {
+                            if !is_private_ip(&ip.to_string()) {
+                                d.ips.insert(ip.to_string());
+                            }
                         }
                     }
                 }
             }
         }
     }
-    data
+    d
 }
 
 fn bambenek_parse(raw: &str) -> FeedData {
-    let mut data = FeedData::default();
+    let mut d = FeedData::default();
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -724,155 +857,167 @@ fn bambenek_parse(raw: &str) -> FeedData {
         }
         let domain = line.split(',').next().unwrap_or("").trim();
         if is_valid_domain(domain) {
-            data.domains.insert(domain.to_lowercase());
+            d.domains.insert(domain.to_lowercase());
         }
     }
-    data
+    d
 }
 
 fn blocklist_de_parse(raw: &str) -> FeedData {
-    let mut data = FeedData::default();
+    let mut d = FeedData::default();
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if line.parse::<IpAddr>().is_ok() && !is_private_ip(line) {
-            data.ips.insert(line.to_string());
+            d.ips.insert(line.to_string());
         }
     }
-    data
+    d
 }
 
 fn emerging_threats_parse(raw: &str) -> FeedData {
-    // EmergingThreats fwrules list: one IP or CIDR per line, comments start with '#'
-    // We store CIDRs directly in the `ips` set (using network address notation) to
-    // avoid exploding /16 and /8 blocks into millions of entries.  Matching is done
-    // by the caller via CIDR containment rather than exact set membership.
-    let mut data = FeedData::default();
+    // Store CIDRs as strings — containment is checked in check_ip via ipnet
+    let mut d = FeedData::default();
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Accept both bare IPs and CIDR notation
         if let Ok(net) = line.parse::<ipnet::IpNet>() {
-            let addr = net.addr().to_string();
-            if !is_private_ip(&addr) {
-                // Store as "addr/prefix" so the check_ip logic can match by CIDR
-                data.ips.insert(net.to_string());
+            if !is_private_ip(&net.addr().to_string()) {
+                d.ips.insert(net.to_string());
             }
         } else if let Ok(ip) = line.parse::<IpAddr>() {
-            let s = ip.to_string();
-            if !is_private_ip(&s) {
-                data.ips.insert(s);
+            if !is_private_ip(&ip.to_string()) {
+                d.ips.insert(ip.to_string());
             }
         }
     }
-    data
-}
-
-async fn otx_download(api_key: &str) -> String {
-    let mut all = Vec::new();
-    let client = &*HTTP_CLIENT;
-    let mut page = 1;
-    while page <= 5 {
-        let url = format!(
-            "https://otx.alienvault.com/api/v1/pulses/subscribed?limit=50&page={}",
-            page
-        );
-        let resp = client
-            .get(&url)
-            .header("X-OTX-API-KEY", api_key)
-            .send()
-            .await;
-        if let Ok(r) = resp {
-            if let Ok(json) = r.json::<Value>().await {
-                if let Some(results) = json.get("results").and_then(|v| v.as_array()) {
-                    for pulse in results {
-                        if let Some(indicators) = pulse.get("indicators").and_then(|v| v.as_array())
-                        {
-                            for ind in indicators {
-                                all.push(ind.clone());
-                            }
-                        }
-                    }
-                }
-                if json.get("next").is_none() {
-                    break;
-                }
-            }
-        }
-        page += 1;
-    }
-    serde_json::to_string(&all).unwrap_or_default()
+    d
 }
 
 fn otx_parse(raw: &str) -> FeedData {
-    let mut data = FeedData::default();
-    if let Ok(indicators) = serde_json::from_str::<Vec<Value>>(raw) {
-        for ind in indicators {
-            let typ = ind.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let value = ind
+    let mut d = FeedData::default();
+    if let Ok(inds) = serde_json::from_str::<Vec<Value>>(raw) {
+        for ind in inds {
+            let t = ind.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let v = ind
                 .get("indicator")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .trim();
-            if value.is_empty() {
+            if v.is_empty() {
                 continue;
             }
-            match typ {
+            match t {
                 "IPv4" | "IPv6" => {
-                    if !is_private_ip(value) {
-                        data.ips.insert(value.to_string());
+                    if !is_private_ip(v) {
+                        d.ips.insert(v.to_string());
                     }
                 }
                 "domain" | "FQDN" | "hostname" => {
-                    if is_valid_domain(value) {
-                        data.domains.insert(value.to_lowercase());
+                    if is_valid_domain(v) {
+                        d.domains.insert(v.to_lowercase());
                     }
                 }
-                "URL" => {
-                    if value.starts_with("http") {
-                        data.urls.insert(value.to_string());
-                    }
+                "URL" if v.starts_with("http") => {
+                    d.urls.insert(v.to_string());
                 }
                 _ => {}
             }
         }
     }
-    data
+    d
 }
 
-// =============================================================================
-// 5b. OTX Collector (AlienVault OTX, API-key based)
-// =============================================================================
+// OTX collector (paginated API download)
 struct OtxCollector {
     api_key: String,
     cache: Arc<FeedCache>,
     force_refresh: bool,
+    verbose: bool,
     data: Arc<Mutex<Option<FeedData>>>,
 }
 
 impl OtxCollector {
     const FEED_ID: &'static str = "otx_alienvault";
-    const TTL: u64 = 7200; // 2 h
+    const TTL: u64 = 7200;
 
     async fn load(&self) -> FeedData {
         {
-            let guard = self.data.lock().await;
-            if let Some(ref d) = *guard {
+            let g = self.data.lock().await;
+            if let Some(ref d) = *g {
                 return d.clone();
             }
         }
         if !self.force_refresh {
             if let Some(cached) = self.cache.get(Self::FEED_ID, Self::TTL) {
+                if self.verbose {
+                    eprintln!(
+                        "  [cache] AlienVault-OTX ({})",
+                        self.cache.age_str(Self::FEED_ID)
+                    );
+                }
                 let fd: FeedData = serde_json::from_value(cached).unwrap_or_default();
                 *self.data.lock().await = Some(fd.clone());
                 return fd;
             }
         }
-        let raw = otx_download(&self.api_key).await;
+        if self.verbose {
+            eprintln!("  [fetch] AlienVault-OTX (paginated)");
+        }
+        let mut all = Vec::new();
+        for page in 1..=5u32 {
+            let url = format!(
+                "https://otx.alienvault.com/api/v1/pulses/subscribed?limit=50&page={}",
+                page
+            );
+            match HTTP_CLIENT
+                .get(&url)
+                .header("X-OTX-API-KEY", &self.api_key)
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    if let Ok(j) = r.json::<Value>().await {
+                        let results = j.get("results").and_then(|v| v.as_array());
+                        if let Some(pulses) = results {
+                            for pulse in pulses {
+                                if let Some(inds) =
+                                    pulse.get("indicators").and_then(|v| v.as_array())
+                                {
+                                    all.extend(inds.iter().cloned());
+                                }
+                            }
+                        }
+                        if j.get("next").is_none() {
+                            break;
+                        }
+                    }
+                }
+                Ok(r) => {
+                    eprintln!(
+                        "{}",
+                        FeedError::HttpOther(r.status().as_u16())
+                            .message("AlienVault-OTX")
+                            .yellow()
+                    );
+                    break;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        FeedError::Network(e.to_string())
+                            .message("AlienVault-OTX")
+                            .yellow()
+                    );
+                    break;
+                }
+            }
+        }
+        let raw = serde_json::to_string(&all).unwrap_or_default();
         let parsed = otx_parse(&raw);
         if let Ok(v) = serde_json::to_value(&parsed) {
             self.cache.set(Self::FEED_ID, &v);
@@ -885,75 +1030,79 @@ impl OtxCollector {
 #[async_trait::async_trait]
 impl ThreatIntelBackend for OtxCollector {
     fn name(&self) -> &'static str {
-        "OTX-AlienVault"
+        "AlienVault-OTX"
+    }
+    fn is_remote_api(&self) -> bool {
+        false
     }
     async fn check_ip(&self, ip: &str) -> Vec<ThreatHit> {
-        let data = self.load().await;
-        if data.ips.contains(ip) {
+        let d = self.load().await;
+        if d.ips.contains(ip) {
             vec![ThreatHit {
-                source: self.name().to_string(),
-                classification_type: "malicious-code".to_string(),
-                classification_taxonomy: "malicious-code".to_string(),
-                confidence: 0.80,
-                details: json!({ "feed": "OTX-AlienVault" }),
+                source: self.name().into(),
+                classification_type: "blacklist".into(),
+                classification_taxonomy: "other".into(),
+                confidence: 0.75,
+                details: json!({ "feed": "AlienVault-OTX" }),
             }]
         } else {
             vec![]
         }
     }
     async fn check_domain(&self, domain: &str) -> Vec<ThreatHit> {
-        let data = self.load().await;
-        let parts: Vec<&str> = domain.split('.').collect();
-        for i in 0..parts.len() {
-            let candidate = parts[i..].join(".");
-            if data.domains.contains(&candidate) {
+        let d = self.load().await;
+        for i in 0..domain.split('.').count() {
+            let c = domain.split('.').skip(i).collect::<Vec<_>>().join(".");
+            if d.domains.contains(&c) {
                 return vec![ThreatHit {
-                    source: self.name().to_string(),
-                    classification_type: "malicious-code".to_string(),
-                    classification_taxonomy: "malicious-code".to_string(),
-                    confidence: 0.80,
-                    details: json!({ "feed": "OTX-AlienVault", "matched": candidate }),
+                    source: self.name().into(),
+                    classification_type: "blacklist".into(),
+                    classification_taxonomy: "other".into(),
+                    confidence: 0.72,
+                    details: json!({ "feed": "AlienVault-OTX", "matched": c }),
                 }];
             }
         }
         vec![]
     }
     async fn check_url(&self, url: &str) -> Vec<ThreatHit> {
-        let data = self.load().await;
-        for feed_url in &data.urls {
-            if url == feed_url || url.starts_with(feed_url.as_str()) {
-                return vec![ThreatHit {
-                    source: self.name().to_string(),
-                    classification_type: "malicious-code".to_string(),
-                    classification_taxonomy: "malicious-code".to_string(),
-                    confidence: 0.80,
-                    details: json!({ "feed": "OTX-AlienVault", "matched": feed_url }),
-                }];
-            }
+        let d = self.load().await;
+        if d.urls.contains(url) {
+            vec![ThreatHit {
+                source: self.name().into(),
+                classification_type: "blacklist".into(),
+                classification_taxonomy: "other".into(),
+                confidence: 0.72,
+                details: json!({ "feed": "AlienVault-OTX", "matched": url }),
+            }]
+        } else {
+            vec![]
         }
-        vec![]
     }
 }
 
 // =============================================================================
-// 5c. Remote API Backends
+// 7. Remote API Backends  (is_remote_api = true → rate limiting applies)
 // =============================================================================
+
 struct AbuseIPDBBackend {
     api_key: String,
     min_score: u8,
     cache: Arc<Mutex<HashMap<String, Vec<ThreatHit>>>>,
 }
-
 #[async_trait::async_trait]
 impl ThreatIntelBackend for AbuseIPDBBackend {
     fn name(&self) -> &'static str {
         "AbuseIPDB"
     }
+    fn is_remote_api(&self) -> bool {
+        true
+    }
     async fn check_ip(&self, ip: &str) -> Vec<ThreatHit> {
         {
-            let cache = self.cache.lock().await;
-            if let Some(hits) = cache.get(ip) {
-                return hits.clone();
+            let g = self.cache.lock().await;
+            if let Some(h) = g.get(ip) {
+                return h.clone();
             }
         }
         let url = format!(
@@ -961,22 +1110,22 @@ impl ThreatIntelBackend for AbuseIPDBBackend {
             ip
         );
         let mut hits = Vec::new();
-        if let Ok(resp) = HTTP_CLIENT
+        if let Ok(r) = HTTP_CLIENT
             .get(&url)
             .header("Key", &self.api_key)
             .header("Accept", "application/json")
             .send()
             .await
         {
-            if let Ok(json) = resp.json::<Value>().await {
-                if let Some(score) = json["data"]["abuseConfidenceScore"].as_u64() {
+            if let Ok(j) = r.json::<Value>().await {
+                if let Some(score) = j["data"]["abuseConfidenceScore"].as_u64() {
                     if score as u8 >= self.min_score {
                         hits.push(ThreatHit {
-                            source: self.name().to_string(),
-                            classification_type: "blacklist".to_string(),
-                            classification_taxonomy: "other".to_string(),
+                            source: self.name().into(),
+                            classification_type: "blacklist".into(),
+                            classification_taxonomy: "other".into(),
                             confidence: score as f64 / 100.0,
-                            details: json["data"].clone(),
+                            details: j["data"].clone(),
                         });
                     }
                 }
@@ -985,10 +1134,10 @@ impl ThreatIntelBackend for AbuseIPDBBackend {
         self.cache.lock().await.insert(ip.to_string(), hits.clone());
         hits
     }
-    async fn check_domain(&self, _domain: &str) -> Vec<ThreatHit> {
+    async fn check_domain(&self, _: &str) -> Vec<ThreatHit> {
         vec![]
     }
-    async fn check_url(&self, _url: &str) -> Vec<ThreatHit> {
+    async fn check_url(&self, _: &str) -> Vec<ThreatHit> {
         vec![]
     }
 }
@@ -998,26 +1147,25 @@ struct VirusTotalBackend {
     min_detections: u32,
     cache: Arc<Mutex<HashMap<String, Vec<ThreatHit>>>>,
 }
-
 impl VirusTotalBackend {
-    async fn _lookup(&self, endpoint: &str, id: &str) -> Vec<ThreatHit> {
+    async fn lookup(&self, endpoint: &str, id: &str) -> Vec<ThreatHit> {
         let key = format!("{}/{}", endpoint, id);
         {
-            let cache = self.cache.lock().await;
-            if let Some(hits) = cache.get(&key) {
-                return hits.clone();
+            let g = self.cache.lock().await;
+            if let Some(h) = g.get(&key) {
+                return h.clone();
             }
         }
         let url = format!("https://www.virustotal.com/api/v3/{}/{}", endpoint, id);
         let mut hits = Vec::new();
-        if let Ok(resp) = HTTP_CLIENT
+        if let Ok(r) = HTTP_CLIENT
             .get(&url)
             .header("x-apikey", &self.api_key)
             .send()
             .await
         {
-            if let Ok(json) = resp.json::<Value>().await {
-                if let Some(attrs) = json.get("data").and_then(|d| d.get("attributes")) {
+            if let Ok(j) = r.json::<Value>().await {
+                if let Some(attrs) = j.get("data").and_then(|d| d.get("attributes")) {
                     let stats = attrs.get("last_analysis_stats").unwrap_or(&json!(null));
                     let mal = stats.get("malicious").and_then(|v| v.as_u64()).unwrap_or(0);
                     let sus = stats
@@ -1028,27 +1176,15 @@ impl VirusTotalBackend {
                         .as_object()
                         .map(|o| o.values().map(|v| v.as_u64().unwrap_or(0)).sum::<u64>())
                         .unwrap_or(1);
-                    let hits_count = mal + sus;
-                    if hits_count >= self.min_detections as u64 {
+                    if mal + sus >= self.min_detections as u64 {
                         hits.push(ThreatHit {
-                            source: self.name().to_string(),
-                            classification_type: if mal > 0 {
-                                "malware".to_string()
-                            } else {
-                                "ids-alert".to_string()
-                            },
-                            classification_taxonomy: if mal > 0 {
-                                "malicious-code".to_string()
-                            } else {
-                                "intrusion-attempts".to_string()
-                            },
-                            confidence: hits_count as f64 / total as f64,
-                            details: json!({
-                                "malicious": mal,
-                                "suspicious": sus,
-                                "total_engines": total,
-                                "reputation": attrs.get("reputation").unwrap_or(&json!(0)),
-                            }),
+                            source:                  self.name().into(),
+                            classification_type:     if mal > 0 { "malware" } else { "ids-alert" }.into(),
+                            classification_taxonomy: if mal > 0 { "malicious-code" } else { "intrusion-attempts" }.into(),
+                            confidence:              (mal + sus) as f64 / total as f64,
+                            details: json!({ "malicious": mal, "suspicious": sus,
+                                            "total_engines": total,
+                                            "reputation": attrs.get("reputation").unwrap_or(&json!(0)) }),
                         });
                     }
                 }
@@ -1058,22 +1194,24 @@ impl VirusTotalBackend {
         hits
     }
 }
-
 #[async_trait::async_trait]
 impl ThreatIntelBackend for VirusTotalBackend {
     fn name(&self) -> &'static str {
         "VirusTotal"
     }
-    async fn check_ip(&self, ip: &str) -> Vec<ThreatHit> {
-        self._lookup("ip_addresses", ip).await
+    fn is_remote_api(&self) -> bool {
+        true
     }
-    async fn check_domain(&self, domain: &str) -> Vec<ThreatHit> {
-        self._lookup("domains", domain).await
+    async fn check_ip(&self, ip: &str) -> Vec<ThreatHit> {
+        self.lookup("ip_addresses", ip).await
+    }
+    async fn check_domain(&self, d: &str) -> Vec<ThreatHit> {
+        self.lookup("domains", d).await
     }
     async fn check_url(&self, url: &str) -> Vec<ThreatHit> {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-        let encoded = URL_SAFE_NO_PAD.encode(url.as_bytes());
-        self._lookup("urls", &encoded).await
+        self.lookup("urls", &URL_SAFE_NO_PAD.encode(url.as_bytes()))
+            .await
     }
 }
 
@@ -1081,64 +1219,64 @@ struct ShodanBackend {
     api_key: String,
     cache: Arc<Mutex<HashMap<String, Vec<ThreatHit>>>>,
 }
-
 #[async_trait::async_trait]
 impl ThreatIntelBackend for ShodanBackend {
     fn name(&self) -> &'static str {
         "Shodan"
     }
+    fn is_remote_api(&self) -> bool {
+        true
+    }
     async fn check_ip(&self, ip: &str) -> Vec<ThreatHit> {
         {
-            let cache = self.cache.lock().await;
-            if let Some(hits) = cache.get(ip) {
-                return hits.clone();
+            let g = self.cache.lock().await;
+            if let Some(h) = g.get(ip) {
+                return h.clone();
             }
         }
         let url = format!(
             "https://api.shodan.io/shodan/host/{}?key={}",
-            ip, &self.api_key
+            ip, self.api_key
         );
         let mut hits = Vec::new();
-        if let Ok(resp) = HTTP_CLIENT.get(&url).send().await {
-            if resp.status().is_success() {
-                if let Ok(json) = resp.json::<Value>().await {
-                    let tags = json
+        if let Ok(r) = HTTP_CLIENT.get(&url).send().await {
+            if r.status().is_success() {
+                if let Ok(j) = r.json::<Value>().await {
+                    let tags: HashSet<&str> = j
                         .get("tags")
                         .and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|t| t.as_str()).collect::<HashSet<_>>())
+                        .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
                         .unwrap_or_default();
-                    let dangerous_tags: Vec<&str> = tags
-                        .into_iter()
+                    let dangerous: Vec<&str> = tags
+                        .iter()
                         .filter(|t| {
                             matches!(
-                                *t,
+                                **t,
                                 "malware" | "c2" | "scanner" | "honeypot" | "compromised"
                             )
                         })
+                        .cloned()
                         .collect();
-                    let ports = json
+                    let ports: Vec<u64> = j
                         .get("ports")
                         .and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|p| p.as_u64()).collect::<Vec<_>>())
+                        .map(|a| a.iter().filter_map(|p| p.as_u64()).collect())
                         .unwrap_or_default();
                     let sus_ports: Vec<u64> = ports
                         .iter()
                         .filter(|p| SUSPICIOUS_PORTS.contains(&(**p as u16)))
-                        .copied()
+                        .cloned()
                         .collect();
-                    if !dangerous_tags.is_empty() || !sus_ports.is_empty() {
+                    if !dangerous.is_empty() || !sus_ports.is_empty() {
                         hits.push(ThreatHit {
-                            source: self.name().to_string(),
-                            classification_type: "potentially-unwanted-accessible".to_string(),
-                            classification_taxonomy: "vulnerable".to_string(),
+                            source: self.name().into(),
+                            classification_type: "potentially-unwanted-accessible".into(),
+                            classification_taxonomy: "vulnerable".into(),
                             confidence: 0.65,
-                            details: json!({
-                                "dangerous_tags": dangerous_tags,
-                                "open_ports": ports,
-                                "suspicious_ports": sus_ports,
-                                "country": json.get("country_name").unwrap_or(&json!(null)),
-                                "org": json.get("org").unwrap_or(&json!(null)),
-                            }),
+                            details: json!({ "dangerous_tags": dangerous, "open_ports": ports,
+                                            "suspicious_ports": sus_ports,
+                                            "country": j.get("country_name"),
+                                            "org":     j.get("org") }),
                         });
                     }
                 }
@@ -1147,10 +1285,10 @@ impl ThreatIntelBackend for ShodanBackend {
         self.cache.lock().await.insert(ip.to_string(), hits.clone());
         hits
     }
-    async fn check_domain(&self, _domain: &str) -> Vec<ThreatHit> {
+    async fn check_domain(&self, _: &str) -> Vec<ThreatHit> {
         vec![]
     }
-    async fn check_url(&self, _url: &str) -> Vec<ThreatHit> {
+    async fn check_url(&self, _: &str) -> Vec<ThreatHit> {
         vec![]
     }
 }
@@ -1162,71 +1300,51 @@ struct IntelMQBackend {
     token: Arc<Mutex<Option<String>>>,
     cache: Arc<Mutex<HashMap<String, Vec<ThreatHit>>>>,
 }
-
 impl IntelMQBackend {
-    async fn _login(&self) -> Option<String> {
-        let url = format!("{}/v1/api/login/", self.base_url);
-        let form = vec![
-            ("username", self.username.as_str()),
-            ("password", self.password.as_str()),
-        ];
-        if let Ok(resp) = HTTP_CLIENT
-            .post(&url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&form)
+    async fn login(&self) -> Option<String> {
+        let r = HTTP_CLIENT
+            .post(format!("{}/v1/api/login/", self.base_url))
+            .form(&[("username", &self.username), ("password", &self.password)])
             .send()
             .await
-        {
-            if let Ok(json) = resp.json::<Value>().await {
-                if let Some(token) = json.get("login_token").and_then(|v| v.as_str()) {
-                    return Some(token.to_string());
-                }
-            }
-        }
-        None
+            .ok()?;
+        r.json::<Value>()
+            .await
+            .ok()?
+            .get("login_token")?
+            .as_str()
+            .map(|s| s.to_string())
     }
-
-    async fn _lookup(&self, field: &str, value: &str) -> Vec<ThreatHit> {
-        let cache_key = format!("{}:{}", field, value);
+    async fn lookup(&self, field: &str, value: &str) -> Vec<ThreatHit> {
+        let key = format!("{}:{}", field, value);
         {
-            let cache = self.cache.lock().await;
-            if let Some(hits) = cache.get(&cache_key) {
-                return hits.clone();
+            let g = self.cache.lock().await;
+            if let Some(h) = g.get(&key) {
+                return h.clone();
             }
         }
-        // Get token without holding lock across await
-        let token_opt = {
-            let mut token_guard = self.token.lock().await;
-            if token_guard.is_none() {
-                *token_guard = self._login().await;
+        let token = {
+            let mut g = self.token.lock().await;
+            if g.is_none() {
+                *g = self.login().await;
             }
-            token_guard.clone()
+            g.clone()
         };
-        let token = match token_opt {
+        let token = match token {
             Some(t) => t,
             None => return vec![],
         };
         let url = format!("{}/v1/api/events?{}={}", self.base_url, field, value);
         let mut hits = Vec::new();
-        if let Ok(resp) = HTTP_CLIENT
+        if let Ok(r) = HTTP_CLIENT
             .get(&url)
             .header("Authorization", &token)
             .send()
             .await
         {
-            if let Ok(events) = resp.json::<Vec<Value>>().await {
+            if let Ok(events) = r.json::<Vec<Value>>().await {
                 for ev in events {
-                    let ctype = ev
-                        .get("classification.type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("undetermined")
-                        .to_string();
-                    let ctax = ev
-                        .get("classification.taxonomy")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("other")
-                        .to_string();
-                    let details = ev
+                    let details: serde_json::Map<String, Value> = ev
                         .as_object()
                         .unwrap()
                         .iter()
@@ -1239,60 +1357,70 @@ impl IntelMQBackend {
                         })
                         .collect();
                     hits.push(ThreatHit {
-                        source: self.name().to_string(),
-                        classification_type: ctype,
-                        classification_taxonomy: ctax,
+                        source: self.name().into(),
+                        classification_type: ev
+                            .get("classification.type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("undetermined")
+                            .into(),
+                        classification_taxonomy: ev
+                            .get("classification.taxonomy")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("other")
+                            .into(),
                         confidence: 0.75,
                         details: Value::Object(details),
                     });
                 }
             }
         }
-        self.cache.lock().await.insert(cache_key, hits.clone());
+        self.cache.lock().await.insert(key, hits.clone());
         hits
     }
 }
-
 #[async_trait::async_trait]
 impl ThreatIntelBackend for IntelMQBackend {
     fn name(&self) -> &'static str {
         "IntelMQ-API"
     }
-    async fn check_ip(&self, ip: &str) -> Vec<ThreatHit> {
-        self._lookup("source.ip", ip).await
+    fn is_remote_api(&self) -> bool {
+        true
     }
-    async fn check_domain(&self, domain: &str) -> Vec<ThreatHit> {
-        self._lookup("source.fqdn", domain).await
+    async fn check_ip(&self, ip: &str) -> Vec<ThreatHit> {
+        self.lookup("source.ip", ip).await
+    }
+    async fn check_domain(&self, d: &str) -> Vec<ThreatHit> {
+        self.lookup("source.fqdn", d).await
     }
     async fn check_url(&self, url: &str) -> Vec<ThreatHit> {
-        self._lookup("source.url", url).await
+        self.lookup("source.url", url).await
     }
 }
 
-// =============================================================================
-// 5c. Local Heuristics
-// =============================================================================
+// Local heuristics
 struct LocalHeuristicBackend;
-
 #[async_trait::async_trait]
 impl ThreatIntelBackend for LocalHeuristicBackend {
     fn name(&self) -> &'static str {
         "LocalHeuristic"
     }
+    fn is_remote_api(&self) -> bool {
+        false
+    }
     async fn check_domain(&self, domain: &str) -> Vec<ThreatHit> {
         lazy_static::lazy_static! {
             static ref PATTERNS: Vec<(Regex, &'static str, f64)> = vec![
-                (Regex::new(r"^[a-z0-9]{16,}\.[a-z]{2,4}$").unwrap(), "Long random label — possible DGA", 0.55),
-                (Regex::new(r"^[a-z0-9]{8,}\.(xyz|top|tk|ml|ga|cf|gq|pw)$").unwrap(), "DGA-like + cheap TLD", 0.65),
-                (Regex::new(r"^[a-z]{3,6}[0-9]{4,}\.[a-z]{2,4}$").unwrap(), "Alphanumeric mix — possible DGA", 0.50),
+                (Regex::new(r"^[a-z0-9]{16,}\.[a-z]{2,4}$").unwrap(),             "Long random label — possible DGA", 0.55),
+                (Regex::new(r"^[a-z0-9]{8,}\.(xyz|top|tk|ml|ga|cf|gq|pw)$").unwrap(), "DGA-like + cheap TLD",         0.65),
+                (Regex::new(r"^[a-z]{3,6}[0-9]{4,}\.[a-z]{2,4}$").unwrap(),       "Alphanumeric mix — possible DGA", 0.50),
             ];
         }
         for (re, reason, conf) in PATTERNS.iter() {
             if re.is_match(domain) {
                 return vec![ThreatHit {
-                    source: self.name().to_string(),
-                    classification_type: "dga-domain".to_string(),
-                    classification_taxonomy: "malicious-code".to_string(),
+                    source: self.name().into(),
+                    classification_type: "dga-domain".into(),
+                    classification_taxonomy: "malicious-code".into(),
                     confidence: *conf,
                     details: json!({ "reason": reason }),
                 }];
@@ -1300,17 +1428,18 @@ impl ThreatIntelBackend for LocalHeuristicBackend {
         }
         vec![]
     }
-    async fn check_ip(&self, _ip: &str) -> Vec<ThreatHit> {
+    async fn check_ip(&self, _: &str) -> Vec<ThreatHit> {
         vec![]
     }
-    async fn check_url(&self, _url: &str) -> Vec<ThreatHit> {
+    async fn check_url(&self, _: &str) -> Vec<ThreatHit> {
         vec![]
     }
 }
 
 // =============================================================================
-// 6. Analysis Engine
+// 8. Analysis Engine
 // =============================================================================
+
 struct Analyser {
     backends: Vec<Arc<dyn ThreatIntelBackend>>,
     rate_limit_ms: u64,
@@ -1320,241 +1449,414 @@ struct Analyser {
 
 impl Analyser {
     async fn analyse(&self, observables: &[Observable]) -> Vec<ThreatMatch> {
-        let total_steps = (observables.len() * self.backends.len()) as u64;
-        let global_start = std::time::Instant::now();
+        let total = (observables.len() * self.backends.len()) as u64;
+        let mut all_matches = Vec::new();
         let mut total_hits: usize = 0;
 
-        // Progress bar — shown whenever not quiet
         let pb = if !self.quiet {
-            let pb = ProgressBar::new(total_steps);
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template(
-                        "[{elapsed_precise}] {bar:40.green/black} {pos:>4}/{len} checks  hits: {msg}",
-                    )
-                    .unwrap()
-                    .progress_chars("█▉▊▋▌▍▎▏ "),
-            );
+            let pb = ProgressBar::new(total);
+            pb.set_style(ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.green/black} {pos:>5}/{len} checks  hits:{msg}")
+                .unwrap()
+                .progress_chars("█▉▊▋▌▍▎▏ "));
             pb.set_message("0");
             Some(pb)
         } else {
             None
         };
 
-        let mut matches = Vec::new();
-
         for obs in observables {
-            let obs_start = std::time::Instant::now();
-
-            if self.verbose {
-                if let Some(ref pb) = pb {
-                    pb.set_message(format!(
-                        "{}  checking {} '{}'",
-                        total_hits,
-                        obs.kind,
-                        truncate(&obs.value, 40),
-                    ));
-                } else {
-                    eprintln!(
-                        "[verbose] checking {} '{}' (seen {} time(s), ctx: {})",
-                        obs.kind, obs.value, obs.count, obs.context
-                    );
-                }
-            }
-
             for backend in &self.backends {
-                let backend_start = std::time::Instant::now();
-
                 let hits = match obs.kind.as_str() {
-                    "ip"     => backend.check_ip(&obs.value).await,
+                    "ip" => backend.check_ip(&obs.value).await,
                     "domain" => backend.check_domain(&obs.value).await,
-                    "url"    => backend.check_url(&obs.value).await,
-                    _        => vec![],
+                    "url" => backend.check_url(&obs.value).await,
+                    _ => vec![],
                 };
 
-                let backend_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
-
                 if self.verbose {
-                    let hit_indicator = if hits.is_empty() {
-                        "·".to_string()
+                    let indicator = if hits.is_empty() {
+                        "·".dimmed().to_string()
                     } else {
-                        format!("HIT x{}", hits.len())
+                        format!("{}", format!("HIT×{}", hits.len()).red().bold())
                     };
                     let msg = format!(
-                        "[verbose]  [{:>8}] {:>18}  {}  ({:.0}ms)",
+                        "  [{:>6}] {:>22}  {}  {}",
                         obs.kind,
-                        truncate(backend.name(), 18),
-                        hit_indicator,
-                        backend_ms,
+                        truncate(backend.name(), 22),
+                        indicator,
+                        truncate(&obs.value, 38)
                     );
-                    if let Some(ref pb) = pb {
-                        pb.println(&msg);
+                    if let Some(pb) = &pb {
+                        pb.println(msg);
                     } else {
                         eprintln!("{}", msg);
                     }
                 }
 
                 total_hits += hits.len();
-
-                if let Some(ref pb) = pb {
+                if let Some(pb) = &pb {
                     pb.set_message(total_hits.to_string());
                     pb.inc(1);
                 }
 
-                for hit in hits {
-                    matches.push(ThreatMatch {
+                for h in hits {
+                    all_matches.push(ThreatMatch {
                         observable: obs.clone(),
-                        ti_source: hit.source,
-                        classification_type: hit.classification_type,
-                        classification_taxonomy: hit.classification_taxonomy,
-                        confidence: hit.confidence,
-                        details: hit.details,
+                        ti_source: h.source,
+                        classification_type: h.classification_type,
+                        classification_taxonomy: h.classification_taxonomy,
+                        confidence: h.confidence,
+                        details: h.details,
                     });
                 }
 
-                if self.rate_limit_ms > 0 {
+                // Rate limit ONLY for remote API backends
+                if backend.is_remote_api() && self.rate_limit_ms > 0 {
                     sleep(Duration::from_millis(self.rate_limit_ms)).await;
                 }
             }
-
-            if self.verbose {
-                let obs_ms = obs_start.elapsed().as_secs_f64() * 1000.0;
-                let summary = format!(
-                    "[verbose] '{}' done in {:.0}ms — {} hit(s) so far",
-                    truncate(&obs.value, 40),
-                    obs_ms,
-                    total_hits,
-                );
-                if let Some(ref pb) = pb {
-                    pb.println(&summary);
-                } else {
-                    eprintln!("{}", summary);
-                }
-            }
         }
 
-        let total_secs = global_start.elapsed().as_secs_f64();
         if let Some(pb) = pb {
-            pb.finish_with_message(format!(
-                "{}  — done in {:.2}s",
-                total_hits,
-                total_secs,
-            ));
-        } else if !self.quiet {
-            println!(
-                "Lookups complete: {} hit(s) in {:.2}s",
-                total_hits,
-                total_secs,
-            );
+            pb.finish_with_message(total_hits.to_string());
         }
-
-        matches
+        all_matches
     }
 }
+
 // =============================================================================
-// 7. Reporting & Export
+// 9. Per-file summary
 // =============================================================================
-fn print_report(matches: &[ThreatMatch], _observables: &[Observable]) {
-    if matches.is_empty() {
-        println!("{}", "✅ No threats detected.".green().bold());
+
+fn print_file_summary(path: &Path, obs: &[Observable], matches: &[ThreatMatch], quiet: bool) {
+    if quiet {
         return;
     }
-    println!("\n{}", "═══ Threat Intelligence Matches ═══".cyan().bold());
-    println!(
-        "{:<14} {:<32} {:<10} {:<18} {:>4}  {}",
-        "Source", "Observable", "Kind", "Classification", "Conf", "Detail"
-    );
-    println!("{}", "─".repeat(100).dimmed());
+    let fname = path.file_name().unwrap_or_default().to_string_lossy();
+    let n_ip = obs.iter().filter(|o| o.kind == "ip").count();
+    let n_dom = obs.iter().filter(|o| o.kind == "domain").count();
+    let n_url = obs.iter().filter(|o| o.kind == "url").count();
+    let n_hits = matches.len();
+    let hit_obs = matches
+        .iter()
+        .map(|m| &m.observable.value)
+        .collect::<HashSet<_>>()
+        .len();
 
-    for m in matches.iter().take(50) {
-        let percent = (m.confidence * 100.0) as usize;
-        let conf_str = format!("{:>3}%", percent);
-        let conf_colored = if percent >= 75 {
-            conf_str.red().bold()
-        } else if percent >= 45 {
-            conf_str.yellow()
+    let status = if n_hits == 0 {
+        "clean".green().bold().to_string()
+    } else {
+        format!("{} match(es) on {} observable(s)", n_hits, hit_obs)
+            .red()
+            .bold()
+            .to_string()
+    };
+
+    println!(
+        "  {}  {}  [{} ip  {} domain  {} url]  →  {}",
+        "▶".cyan(),
+        fname.bold(),
+        n_ip,
+        n_dom,
+        n_url,
+        status
+    );
+}
+
+// =============================================================================
+// 10. Final consolidated report
+// =============================================================================
+
+fn print_final_report(
+    all_obs: &[Observable],
+    all_matches: &[ThreatMatch],
+    backends: &[Arc<dyn ThreatIntelBackend>],
+    n_files: usize,
+) {
+    let sep = "═".repeat(100);
+    println!("\n{}", sep.cyan());
+    println!(
+        "{}",
+        format!(
+            "  {} v{}  —  Consolidated Report  ({} file(s))",
+            TOOL_NAME, VERSION, n_files
+        )
+        .cyan()
+        .bold()
+    );
+    println!("{}", sep.cyan());
+
+    let n_ip = all_obs.iter().filter(|o| o.kind == "ip").count();
+    let n_dom = all_obs.iter().filter(|o| o.kind == "domain").count();
+    let n_url = all_obs.iter().filter(|o| o.kind == "url").count();
+    let hit_obs_vals: HashSet<&str> = all_matches
+        .iter()
+        .map(|m| m.observable.value.as_str())
+        .collect();
+
+    println!(
+        "  Observables : {} total  ({} {}, {} {}, {} {})",
+        all_obs.len(),
+        n_ip,
+        " IP  ".on_blue().white(),
+        n_dom,
+        " DOM ".on_magenta().white(),
+        n_url,
+        " URL ".on_cyan().black(),
+    );
+    println!(
+        "  Backends    : {}",
+        backends
+            .iter()
+            .map(|b| b.name())
+            .collect::<Vec<_>>()
+            .join("  ·  ")
+    );
+    if all_matches.is_empty() {
+        println!(
+            "\n  {}  No threats detected across all files.\n",
+            "✅".green()
+        );
+        return;
+    }
+
+    let high = all_matches.iter().filter(|m| m.confidence >= 0.75).count();
+    let med = all_matches
+        .iter()
+        .filter(|m| m.confidence >= 0.45 && m.confidence < 0.75)
+        .count();
+    let low = all_matches.iter().filter(|m| m.confidence < 0.45).count();
+    println!(
+        "  Threats     : {} match(es) on {} unique observable(s)  [ {} HIGH  {} MED  {} LOW ]",
+        all_matches.len().to_string().red().bold(),
+        hit_obs_vals.len().to_string().red(),
+        high.to_string().red().bold(),
+        med.to_string().yellow().bold(),
+        low.to_string().cyan().bold(),
+    );
+
+    // ── Threat matches table ──────────────────────────────────────────────────
+    println!("\n{}", "─── Threat Matches ─────────────────────────────────────────────────────────────────────────────────".dimmed());
+    println!(
+        "  {:<6}  {:<5}  {:<32}  {:<16}  {:<22}  {:<22}  {:>4}  {}",
+        "SEV", "TYPE", "OBSERVABLE", "TI SOURCE", "CLASS.TYPE", "TAXONOMY", "CONF", "KEY DETAIL"
+    );
+    println!("{}", "─".repeat(140).dimmed());
+
+    let mut sorted = all_matches.to_vec();
+    sorted.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+
+    for m in sorted.iter().take(100) {
+        let pct = format!("{:>3}%", (m.confidence * 100.0) as usize);
+        let conf_col = if m.confidence >= 0.75 {
+            pct.red().bold()
+        } else if m.confidence >= 0.45 {
+            pct.yellow().bold()
         } else {
-            conf_str.cyan()
+            pct.cyan()
         };
-        let detail = m
+        let detail: &str = m
             .details
             .get("reason")
             .or_else(|| m.details.get("matched"))
             .or_else(|| m.details.get("matched_cidr"))
+            .or_else(|| m.details.get("isp"))
+            .or_else(|| m.details.get("org"))
+            .or_else(|| m.details.get("countryCode"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
         println!(
-            "{:<14} {:<32} {:<10} {:<18} {}  {}",
-            m.ti_source,
+            "  {}  {}  {:<32}  {:<16}  {:<22}  {:<22}  {}  {}",
+            severity_badge(m.confidence),
+            kind_badge(&m.observable.kind),
             truncate(&m.observable.value, 31),
-            m.observable.kind,
-            truncate(&m.classification_type, 17),
-            conf_colored,
-            detail,
+            truncate(&m.ti_source, 15),
+            truncate(&m.classification_type, 21),
+            truncate(&m.classification_taxonomy, 21),
+            conf_col,
+            truncate(detail, 40),
         );
     }
-    if matches.len() > 50 {
+    if sorted.len() > 100 {
         println!(
-            "{}",
-            format!("  … and {} more matches (use --output-json for full results)", matches.len() - 50).dimmed()
+            "  {}",
+            format!(
+                "  … {} more matches not shown — use --output-json for full results",
+                sorted.len() - 100
+            )
+            .dimmed()
         );
     }
 
-    // Summary
-    let high = matches.iter().filter(|m| m.confidence >= 0.75).count();
-    let med  = matches.iter().filter(|m| m.confidence >= 0.45 && m.confidence < 0.75).count();
-    let low  = matches.iter().filter(|m| m.confidence < 0.45).count();
-    println!("\n{}", "─".repeat(100).dimmed());
+    // ── Hit observables detail ────────────────────────────────────────────────
+    println!("\n{}", "─── Flagged Observables ─────────────────────────────────────────────────────────────────────────────".dimmed());
     println!(
-        "Total matches: {}   {} high   {} medium   {} low",
-        matches.len().to_string().bold(),
-        high.to_string().red(),
-        med.to_string().yellow(),
-        low.to_string().cyan()
+        "  {:<5}  {:<38}  {:<14}  {:>5}  {:<16}  {}",
+        "TYPE", "VALUE", "CONTEXT", "COUNT", "FILE", "SOURCES"
     );
-}
+    println!("{}", "─".repeat(120).dimmed());
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max.saturating_sub(1)])
+    let mut hit_obs_list: Vec<&Observable> = all_obs
+        .iter()
+        .filter(|o| hit_obs_vals.contains(o.value.as_str()))
+        .collect();
+    hit_obs_list.sort_by(|a, b| b.count.cmp(&a.count));
+
+    for obs in hit_obs_list.iter().take(50) {
+        let sources: Vec<&str> = all_matches
+            .iter()
+            .filter(|m| m.observable.value == obs.value)
+            .map(|m| m.ti_source.as_str())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        println!(
+            "  {}  {:<38}  {:<14}  {:>5}  {:<16}  {}",
+            kind_badge(&obs.kind),
+            truncate(&obs.value, 37),
+            truncate(&obs.context, 13),
+            obs.count,
+            truncate(
+                Path::new(&obs.source_file)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_str()
+                    .unwrap_or(""),
+                15
+            ),
+            sources.join(", "),
+        );
     }
+
+    // ── Feed status ────────────────────────────────────────────────────────────
+    println!("\n{}", "─── Feed Status ─────────────────────────────────────────────────────────────────────────────────────".dimmed());
+    println!("  {:<22}  {:<8}  {}", "FEED", "REMOTE?", "STATUS");
+    println!("{}", "─".repeat(60).dimmed());
+    for b in backends.iter() {
+        let remote = if b.is_remote_api() {
+            "API   "
+        } else {
+            "local "
+        };
+        println!("  {:<22}  {}  {}", b.name(), remote, "active".green());
+    }
+    println!();
 }
 
-fn export_json(matches: &[ThreatMatch], observables: &[Observable], path: &str) -> Result<()> {
+// =============================================================================
+// 11. Export
+// =============================================================================
+
+fn export_json(matches: &[ThreatMatch], obs: &[Observable], path: &str) -> Result<()> {
     let out = json!({
-        "tool": TOOL_NAME,
-        "version": VERSION,
+        "tool":         TOOL_NAME,
+        "version":      VERSION,
         "generated_at": chrono::Utc::now().to_rfc3339(),
-        "observables": observables,
+        "summary": {
+            "total_observables": obs.len(),
+            "total_matches":     matches.len(),
+            "unique_hits":       matches.iter().map(|m| &m.observable.value)
+                                    .collect::<HashSet<_>>().len(),
+        },
+        "observables":    obs,
         "threat_matches": matches,
     });
     fs::write(path, serde_json::to_string_pretty(&out)?)?;
     Ok(())
 }
 
-fn export_csv(matches: &[ThreatMatch], path: &str) -> Result<()> {
+fn export_csv(
+    matches: &[ThreatMatch],
+    obs_index: &HashMap<String, &Observable>,
+    path: &str,
+) -> Result<()> {
     let mut wtr = csv::Writer::from_path(path)?;
+
+    // Header — richer than v2.0
     wtr.write_record(&[
-        "observable",
-        "kind",
+        // Observable columns
+        "asset_type", // ip | domain | url
+        "asset_value",
+        "asset_context", // dns-query, http-host, source, destination…
+        "asset_count",   // how many packets contained this observable
         "source_file",
+        // TI hit columns
         "ti_source",
         "classification_type",
         "classification_taxonomy",
-        "confidence",
-        "details",
+        "severity",       // HIGH | MED | LOW  (derived from confidence)
+        "confidence_pct", // 0–100 integer
+        // Expanded detail columns (stable across most feeds)
+        "detail_matched",     // exact matched value (CIDR, URL prefix, domain…)
+        "detail_reason",      // heuristic reason text
+        "detail_abuse_score", // AbuseIPDB score
+        "detail_isp",         // AbuseIPDB ISP
+        "detail_country",     // AbuseIPDB / Shodan country
+        "detail_malicious_engines", // VirusTotal
+        "detail_suspicious_engines", // VirusTotal
+        "detail_total_engines", // VirusTotal
+        "detail_dangerous_tags", // Shodan
+        "detail_suspicious_ports", // Shodan
+        // Raw JSON for any remaining detail fields
+        "details_json",
     ])?;
+
+    let str_val = |v: &Value| -> String {
+        match v {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        }
+    };
+
     for m in matches {
+        let obs_key = format!("{}:{}", m.observable.kind, m.observable.value);
+        let obs = obs_index.get(&obs_key);
+
         wtr.write_record(&[
-            &m.observable.value,
             &m.observable.kind,
+            &m.observable.value,
+            obs.map(|o| o.context.as_str()).unwrap_or(""),
+            &obs.map(|o| o.count.to_string()).unwrap_or_default(),
             &m.observable.source_file,
             &m.ti_source,
             &m.classification_type,
             &m.classification_taxonomy,
-            &format!("{:.2}", m.confidence),
+            m.severity(),
+            &format!("{}", (m.confidence * 100.0) as u32),
+            // Expanded details
+            &str_val(
+                m.details
+                    .get("matched")
+                    .unwrap_or(m.details.get("matched_cidr").unwrap_or(&Value::Null)),
+            ),
+            &str_val(m.details.get("reason").unwrap_or(&Value::Null)),
+            &str_val(
+                &m.details
+                    .get("abuseConfidenceScore")
+                    .or_else(|| m.details.get("abuse_score"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+            &str_val(m.details.get("isp").unwrap_or(&Value::Null)),
+            &str_val(
+                m.details
+                    .get("countryCode")
+                    .or_else(|| m.details.get("country"))
+                    .unwrap_or(&Value::Null),
+            ),
+            &str_val(m.details.get("malicious").unwrap_or(&Value::Null)),
+            &str_val(m.details.get("suspicious").unwrap_or(&Value::Null)),
+            &str_val(m.details.get("total_engines").unwrap_or(&Value::Null)),
+            &m.details
+                .get("dangerous_tags")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            &m.details
+                .get("suspicious_ports")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             &serde_json::to_string(&m.details).unwrap_or_default(),
         ])?;
     }
@@ -1563,40 +1865,44 @@ fn export_csv(matches: &[ThreatMatch], path: &str) -> Result<()> {
 }
 
 // =============================================================================
-// 8. CLI and Main
+// 12. CLI
 // =============================================================================
+
 fn build_cli() -> Command {
     Command::new(TOOL_NAME)
         .version(VERSION)
-        .about("Analyse PCAP files with IntelMQ-compatible threat intelligence (full Rust version)")
+        .about("Analyse PCAP files against IntelMQ-compatible threat intelligence feeds")
         .arg(
             Arg::new("pcap_files")
                 .required(true)
                 .num_args(1..)
-                .help("PCAP/CAP files"),
+                .help("PCAP/CAP files to analyse"),
         )
         .arg(
             Arg::new("workers")
                 .long("workers")
                 .default_value("4")
-                .help("Parallel workers"),
+                .help("Parallel extraction workers"),
         )
         .arg(
             Arg::new("quiet")
                 .short('q')
                 .long("quiet")
-                .action(ArgAction::SetTrue),
+                .action(ArgAction::SetTrue)
+                .help("Suppress all output except errors"),
         )
         .arg(
             Arg::new("verbose")
                 .short('v')
                 .long("verbose")
-                .action(ArgAction::SetTrue),
+                .action(ArgAction::SetTrue)
+                .help("Show per-check detail"),
         )
         .arg(
             Arg::new("refresh-feeds")
                 .long("refresh-feeds")
-                .action(ArgAction::SetTrue),
+                .action(ArgAction::SetTrue)
+                .help("Force re-download all feeds"),
         )
         .arg(
             Arg::new("cache-dir")
@@ -1623,7 +1929,8 @@ fn build_cli() -> Command {
         .arg(
             Arg::new("rate-limit")
                 .long("rate-limit")
-                .default_value("0.2"),
+                .default_value("0.2")
+                .help("Seconds between remote API calls"),
         )
         // Feed disable flags
         .arg(
@@ -1694,60 +2001,77 @@ fn build_cli() -> Command {
         .arg(Arg::new("intelmq-pass").long("intelmq-pass"))
 }
 
-async fn run() -> Result<()> {
-    let cli = build_cli();
-    let args = cli.get_matches();
+// =============================================================================
+// 13. Main
+// =============================================================================
 
-    let pcap_files: Vec<PathBuf> = args
-        .get_many::<String>("pcap_files")
-        .unwrap()
-        .map(|s| PathBuf::from(s))
-        .collect();
+async fn run() -> Result<()> {
+    let args = build_cli().get_matches();
+    let quiet = args.get_flag("quiet");
+    let verbose = args.get_flag("verbose") && !quiet;
+    let refresh_feeds = args.get_flag("refresh-feeds");
+    let include_priv = args.get_flag("include-private");
     let workers: usize = args
         .get_one::<String>("workers")
         .unwrap()
         .parse()
         .unwrap_or(4);
-    let quiet = args.get_flag("quiet");
-    let verbose = args.get_flag("verbose");
-    let refresh_feeds = args.get_flag("refresh-feeds");
+    let rate_ms: u64 = (args
+        .get_one::<String>("rate-limit")
+        .unwrap()
+        .parse::<f64>()
+        .unwrap_or(0.2)
+        * 1000.0) as u64;
     let cache_dir = PathBuf::from(args.get_one::<String>("cache-dir").unwrap());
-    let include_private = args.get_flag("include-private");
-    let kinds_str = args.get_one::<String>("kinds").unwrap();
-    let kinds: HashSet<String> = kinds_str
+    let kinds: HashSet<String> = args
+        .get_one::<String>("kinds")
+        .unwrap()
         .split_whitespace()
         .map(|s| s.to_string())
         .collect();
-    let output_json = args.get_one::<String>("output-json").cloned();
-    let output_csv = args.get_one::<String>("output-csv").cloned();
-    let rate_limit_secs: f64 = args
-        .get_one::<String>("rate-limit")
+    let pcap_files: Vec<PathBuf> = args
+        .get_many::<String>("pcap_files")
         .unwrap()
-        .parse()
-        .unwrap_or(0.2);
-    let rate_limit_ms = (rate_limit_secs * 1000.0) as u64;
+        .map(PathBuf::from)
+        .collect();
 
-    // Build feed cache
-    let cache = Arc::new(FeedCache::new(cache_dir.clone()));
-    if verbose && !quiet {
-        eprintln!(
-            "[verbose] cache dir: {}",
-            cache_dir.display()
-        );
-    }
-
-    // Build backends vector
+    let cache = Arc::new(FeedCache::new(cache_dir));
     let mut backends: Vec<Arc<dyn ThreatIntelBackend>> = Vec::new();
 
-    // Feeds (unless disabled)
+    macro_rules! feed {
+        ($name:expr, $id:expr, $url:expr, $ttl:expr,
+         $it:expr,$ix:expr,$ic:expr,
+         $dt:expr,$dx:expr,$dc:expr,
+         $ut:expr,$ux:expr,$uc:expr,
+         $parser:expr) => {
+            Arc::new(FeedCollector::new(
+                $name,
+                $id,
+                $url.to_string(),
+                $ttl,
+                cache.clone(),
+                refresh_feeds,
+                verbose,
+                $it,
+                $ix,
+                $ic,
+                $dt,
+                $dx,
+                $dc,
+                $ut,
+                $ux,
+                $uc,
+                $parser,
+            ))
+        };
+    }
+
     if !args.get_flag("no-urlhaus") {
-        let feed = FeedCollector::new(
+        backends.push(feed!(
             "URLhaus",
             "urlhaus",
-            "https://urlhaus.abuse.ch/downloads/csv/".to_string(),
+            "https://urlhaus.abuse.ch/downloads/csv/",
             3600,
-            cache.clone(),
-            refresh_feeds,
             "malware-distribution",
             "malicious-code",
             0.90,
@@ -1757,18 +2081,15 @@ async fn run() -> Result<()> {
             "malware-distribution",
             "malicious-code",
             0.90,
-            urlhaus_parse,
-        );
-        backends.push(Arc::new(feed));
+            urlhaus_parse
+        ));
     }
     if !args.get_flag("no-feodo") {
-        let feed = FeedCollector::new(
+        backends.push(feed!(
             "FeodoTracker",
             "feodo_tracker",
-            "https://feodotracker.abuse.ch/downloads/ipblocklist.csv".to_string(),
+            "https://feodotracker.abuse.ch/downloads/ipblocklist.csv",
             3600,
-            cache.clone(),
-            refresh_feeds,
             "c2-server",
             "malicious-code",
             0.95,
@@ -1778,30 +2099,24 @@ async fn run() -> Result<()> {
             "",
             "",
             0.0,
-            feodo_parse,
-        );
-        backends.push(Arc::new(feed));
+            feodo_parse
+        ));
     }
     if !args.get_flag("no-phishtank") {
-        let api_key = args
+        let key = args
             .get_one::<String>("phishtank-key")
             .cloned()
             .unwrap_or_default();
-        let url = if api_key.is_empty() {
+        let url = if key.is_empty() {
             "https://data.phishtank.com/data/online-valid.csv".to_string()
         } else {
-            format!(
-                "https://data.phishtank.com/data/{}/online-valid.csv",
-                api_key
-            )
+            format!("https://data.phishtank.com/data/{}/online-valid.csv", key)
         };
-        let feed = FeedCollector::new(
+        backends.push(feed!(
             "PhishTank",
             "phishtank",
             url,
             3600,
-            cache.clone(),
-            refresh_feeds,
             "",
             "",
             0.0,
@@ -1811,18 +2126,15 @@ async fn run() -> Result<()> {
             "phishing",
             "fraud",
             0.92,
-            phishtank_parse,
-        );
-        backends.push(Arc::new(feed));
+            phishtank_parse
+        ));
     }
     if !args.get_flag("no-bambenek") {
-        let feed = FeedCollector::new(
+        backends.push(feed!(
             "Bambenek",
             "bambenek_c2",
-            "https://osint.bambenekconsulting.com/feeds/c2-dommasterlist-high.txt".to_string(),
+            "https://osint.bambenekconsulting.com/feeds/c2-dommasterlist-high.txt",
             3600,
-            cache.clone(),
-            refresh_feeds,
             "",
             "",
             0.0,
@@ -1832,18 +2144,15 @@ async fn run() -> Result<()> {
             "",
             "",
             0.0,
-            bambenek_parse,
-        );
-        backends.push(Arc::new(feed));
+            bambenek_parse
+        ));
     }
     if !args.get_flag("no-blocklist-de") {
-        let feed = FeedCollector::new(
+        backends.push(feed!(
             "Blocklist.de",
             "blocklist_de",
-            "https://lists.blocklist.de/lists/all.txt".to_string(),
+            "https://lists.blocklist.de/lists/all.txt",
             43200,
-            cache.clone(),
-            refresh_feeds,
             "brute-force",
             "intrusion-attempts",
             0.80,
@@ -1853,18 +2162,15 @@ async fn run() -> Result<()> {
             "",
             "",
             0.0,
-            blocklist_de_parse,
-        );
-        backends.push(Arc::new(feed));
+            blocklist_de_parse
+        ));
     }
     if !args.get_flag("no-emerging-threats") {
-        let feed = FeedCollector::new(
+        backends.push(feed!(
             "EmergingThreats",
             "emerging_threats",
-            "https://rules.emergingthreats.net/fwrules/emerging-Block-IPs.txt".to_string(),
+            "https://rules.emergingthreats.net/fwrules/emerging-Block-IPs.txt",
             86400,
-            cache.clone(),
-            refresh_feeds,
             "infected-system",
             "malicious-code",
             0.82,
@@ -1874,210 +2180,181 @@ async fn run() -> Result<()> {
             "",
             "",
             0.0,
-            emerging_threats_parse,
-        );
-        backends.push(Arc::new(feed));
+            emerging_threats_parse
+        ));
     }
-    if let Some(otx_key) = args.get_one::<String>("otx-key").cloned() {
-        // OTX: download pulses at startup and parse into a FeedCollector-style FeedData.
-        // We use a dedicated OTX collector that fetches via the API and reuses the cache.
-        let otx_cache = cache.clone();
-        let otx_feed = OtxCollector {
-            api_key: otx_key,
-            cache: otx_cache,
+    if let Some(key) = args.get_one::<String>("otx-key").filter(|k| !k.is_empty()) {
+        backends.push(Arc::new(OtxCollector {
+            api_key: key.clone(),
+            cache: cache.clone(),
             force_refresh: refresh_feeds,
+            verbose,
             data: Arc::new(Mutex::new(None)),
-        };
-        backends.push(Arc::new(otx_feed));
+        }));
     }
-
-    // Remote API backends
-    if let Some(key) = args.get_one::<String>("abuseipdb-key") {
-        let min_score: u8 = args
+    if let Some(key) = args
+        .get_one::<String>("abuseipdb-key")
+        .filter(|k| !k.is_empty())
+    {
+        let min: u8 = args
             .get_one::<String>("abuseipdb-min-score")
             .unwrap()
             .parse()
             .unwrap_or(25);
-        let backend = AbuseIPDBBackend {
+        backends.push(Arc::new(AbuseIPDBBackend {
             api_key: key.clone(),
-            min_score,
+            min_score: min,
             cache: Arc::new(Mutex::new(HashMap::new())),
-        };
-        backends.push(Arc::new(backend));
+        }));
     }
-    if let Some(key) = args.get_one::<String>("virustotal-key") {
-        let min_detections: u32 = args
+    if let Some(key) = args
+        .get_one::<String>("virustotal-key")
+        .filter(|k| !k.is_empty())
+    {
+        let min: u32 = args
             .get_one::<String>("virustotal-min-detections")
             .unwrap()
             .parse()
             .unwrap_or(2);
-        let backend = VirusTotalBackend {
+        backends.push(Arc::new(VirusTotalBackend {
             api_key: key.clone(),
-            min_detections,
+            min_detections: min,
             cache: Arc::new(Mutex::new(HashMap::new())),
-        };
-        backends.push(Arc::new(backend));
+        }));
     }
-    if let Some(key) = args.get_one::<String>("shodan-key") {
-        let backend = ShodanBackend {
+    if let Some(key) = args
+        .get_one::<String>("shodan-key")
+        .filter(|k| !k.is_empty())
+    {
+        backends.push(Arc::new(ShodanBackend {
             api_key: key.clone(),
             cache: Arc::new(Mutex::new(HashMap::new())),
-        };
-        backends.push(Arc::new(backend));
+        }));
     }
     if let (Some(url), Some(user), Some(pass)) = (
-        args.get_one::<String>("intelmq-url"),
-        args.get_one::<String>("intelmq-user"),
+        args.get_one::<String>("intelmq-url")
+            .filter(|s| !s.is_empty()),
+        args.get_one::<String>("intelmq-user")
+            .filter(|s| !s.is_empty()),
         args.get_one::<String>("intelmq-pass"),
     ) {
-        let backend = IntelMQBackend {
+        backends.push(Arc::new(IntelMQBackend {
             base_url: url.clone(),
             username: user.clone(),
             password: pass.clone(),
             token: Arc::new(Mutex::new(None)),
             cache: Arc::new(Mutex::new(HashMap::new())),
-        };
-        backends.push(Arc::new(backend));
+        }));
     }
     if !args.get_flag("no-heuristics") {
         backends.push(Arc::new(LocalHeuristicBackend));
     }
 
     if !quiet {
-        println!("{} {} (Rust multicore)", TOOL_NAME, VERSION);
         println!(
-            "Backends: {}",
-            backends
-                .iter()
-                .map(|b| b.name())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        if verbose {
-            println!(
-                "[verbose] cache-dir: {}  rate-limit: {}ms  workers: {}  kinds: {:?}",
-                args.get_one::<String>("cache-dir").unwrap(),
-                rate_limit_ms,
-                workers,
-                {
-                    let mut ks: Vec<_> = kinds.iter().collect();
-                    ks.sort();
-                    ks
-                }
-            );
-            println!(
-                "[verbose] include-private: {}  refresh-feeds: {}",
-                include_private, refresh_feeds
-            );
-            // Print cache age for each local feed
-            for feed_id in &["urlhaus", "feodo_tracker", "phishtank", "bambenek_c2",
-                              "blocklist_de", "emerging_threats", "otx_alienvault"] {
-                let age = cache.age_str(feed_id);
-                eprintln!("[verbose] feed cache '{}': {}", feed_id, age);
-            }
-        }
-    }
-
-    // Extract observables in parallel
-    if !quiet {
-        println!(
-            "Extracting observables from {} file(s) using {} workers...",
-            pcap_files.len(),
-            workers
-        );
-    }
-    let pb = if !quiet {
-        let pb = ProgressBar::new(pcap_files.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} files  {msg}")
-                .unwrap()
-                .progress_chars("█▉▊▋▌▍▎▏ "),
-        );
-        Some(pb)
-    } else {
-        None
-    };
-
-    // Use rayon for parallel extraction
-    let all_obs: Vec<Observable> = pcap_files
-        .par_iter()
-        .flat_map(|path| {
-            if verbose && !quiet {
-                eprintln!("[verbose] extracting: {}", path.display());
-            }
-            let result = extract_observables_from_pcap(path, include_private, &kinds)
-                .unwrap_or_else(|e| {
-                    eprintln!("{} extracting {}: {}", "ERROR".red().bold(), path.display(), e);
-                    vec![]
-                });
-            if verbose && !quiet {
-                eprintln!("[verbose] {} → {} observables", path.display(), result.len());
-            }
-            if let Some(pb) = &pb {
-                pb.inc(1);
-            }
-            result
-        })
-        .collect();
-
-    if let Some(pb) = pb {
-        pb.finish();
-    }
-
-    // Deduplicate
-    let mut dedup_map = HashMap::new();
-    for o in all_obs {
-        let key = format!("{}:{}", o.kind, o.value);
-        dedup_map
-            .entry(key)
-            .and_modify(|e: &mut Observable| e.count += o.count)
-            .or_insert(o);
-    }
-    let unique_obs: Vec<Observable> = dedup_map.into_values().collect();
-
-    if unique_obs.is_empty() {
-        if !quiet {
-            println!("No analyzable observables found.");
-        }
-        return Ok(());
-    }
-    if !quiet {
-        let ip_count = unique_obs.iter().filter(|o| o.kind == "ip").count();
-        let dom_count = unique_obs.iter().filter(|o| o.kind == "domain").count();
-        let url_count = unique_obs.iter().filter(|o| o.kind == "url").count();
-        println!(
-            "Unique observables: {} (IPs: {}, domains: {}, URLs: {})",
-            unique_obs.len(), ip_count, dom_count, url_count
-        );
-        println!(
-            "Running {} checks across {} backend(s)…",
-            unique_obs.len() * backends.len(),
+            "{} v{}  (Rust · {} backends)",
+            TOOL_NAME,
+            VERSION,
             backends.len()
         );
     }
 
+    // Extract observables in parallel using rayon
+    if !quiet {
+        println!(
+            "\nExtracting observables from {} file(s) with {} workers…",
+            pcap_files.len(),
+            workers
+        );
+    }
+
+    let all_obs: Vec<Observable> = pcap_files
+        .par_iter()
+        .flat_map(
+            |p| match extract_observables_from_pcap(p, include_priv, &kinds) {
+                Ok(obs) => obs,
+                Err(e) => {
+                    eprintln!("{} {}: {}", "ERROR".red().bold(), p.display(), e);
+                    vec![]
+                }
+            },
+        )
+        .collect();
+
+    // Deduplicate
+    let mut dedup: HashMap<String, Observable> = HashMap::new();
+    for o in all_obs {
+        dedup
+            .entry(format!("{}:{}", o.kind, o.value))
+            .and_modify(|e| e.count += o.count)
+            .or_insert(o);
+    }
+    let unique_obs: Vec<Observable> = dedup.into_values().collect();
+
+    if unique_obs.is_empty() {
+        if !quiet {
+            println!("No analysable observables found.");
+        }
+        return Ok(());
+    }
+    if !quiet {
+        let n_ip = unique_obs.iter().filter(|o| o.kind == "ip").count();
+        let n_dom = unique_obs.iter().filter(|o| o.kind == "domain").count();
+        let n_url = unique_obs.iter().filter(|o| o.kind == "url").count();
+        println!(
+            "Unique observables: {}  (IPs: {}  domains: {}  URLs: {})",
+            unique_obs.len(),
+            n_ip,
+            n_dom,
+            n_url
+        );
+    }
+
     let analyser = Analyser {
-        backends,
-        rate_limit_ms,
-        verbose: verbose && !quiet,
+        backends: backends.clone(),
+        rate_limit_ms: rate_ms,
+        verbose,
         quiet,
     };
     let matches = analyser.analyse(&unique_obs).await;
 
+    // Per-file summaries
     if !quiet {
-        print_report(&matches, &unique_obs);
-    }
-    if let Some(path) = output_json {
-        export_json(&matches, &unique_obs, &path)?;
-        if !quiet {
-            println!("JSON exported to {}", path);
+        println!();
+        for p in &pcap_files {
+            let file_obs: Vec<&Observable> = unique_obs
+                .iter()
+                .filter(|o| o.source_file == p.display().to_string())
+                .collect();
+            let file_matches: Vec<&ThreatMatch> = matches
+                .iter()
+                .filter(|m| m.observable.source_file == p.display().to_string())
+                .collect();
+            let obs_owned: Vec<Observable> = file_obs.iter().map(|o| (*o).clone()).collect();
+            let mat_owned: Vec<ThreatMatch> = file_matches.iter().map(|m| (*m).clone()).collect();
+            print_file_summary(p, &obs_owned, &mat_owned, quiet);
         }
     }
-    if let Some(path) = output_csv {
-        export_csv(&matches, &path)?;
+
+    if !quiet {
+        print_final_report(&unique_obs, &matches, &backends, pcap_files.len());
+    }
+
+    if let Some(path) = args.get_one::<String>("output-json") {
+        export_json(&matches, &unique_obs, path)?;
         if !quiet {
-            println!("CSV exported to {}", path);
+            println!("  JSON  → {}", path);
+        }
+    }
+    if let Some(path) = args.get_one::<String>("output-csv") {
+        // Build index for enriching CSV rows with observable metadata
+        let obs_index: HashMap<String, &Observable> = unique_obs
+            .iter()
+            .map(|o| (format!("{}:{}", o.kind, o.value), o))
+            .collect();
+        export_csv(&matches, &obs_index, path)?;
+        if !quiet {
+            println!("  CSV   → {}", path);
         }
     }
 
